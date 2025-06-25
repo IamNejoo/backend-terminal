@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: terminal_postgres
+    environment:
+      POSTGRES_USER: terminal_user
+      POSTGRES_PASSWORD: terminal_pass
+      POSTGRES_DB: terminal_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U terminal_user -d terminal_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - terminal_network
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: terminal_backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./app:/app/app
+      - ./data:/app/data
+      - ./scripts:/app/scripts
+    ports:
+      - "8000:8000"
+    environment:
+      - POSTGRES_SERVER=postgres
+      - POSTGRES_USER=terminal_user
+      - POSTGRES_PASSWORD=terminal_pass
+      - POSTGRES_DB=terminal_db
+      - POSTGRES_PORT=5432
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - terminal_network
+
+volumes:
+  postgres_data:
+
+networks:
+  terminal_network:
+    driver: bridge
