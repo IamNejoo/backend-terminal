@@ -1,0 +1,14 @@
+{
+  "resultados_Semana_31_Modelo1_min_max.xlsx": {
+    "tipo": "ValueError",
+    "mensaje": "Hoja 'Real' no encontrada en el archivo",
+    "traceback": "Traceback (most recent call last):\n  File \"/app/scripts/load_camila_data.py\", line 97, in load_initial_data\n    await loader.load_camila_file(\n  File \"/app/app/services/camila_loader.py\", line 41, in load_camila_file\n    raise ValueError(f\"Hoja '{sheet}' no encontrada en el archivo\")\nValueError: Hoja 'Real' no encontrada en el archivo\n",
+    "config": {
+      "semana": 31,
+      "dia": "Friday",
+      "turno": 1,
+      "modelo_tipo": "minmax",
+      "con_segregaciones": true
+    }
+  }
+}

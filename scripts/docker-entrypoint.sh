@@ -227,7 +227,7 @@ if [ "$CAMILA_COUNT" -eq "0" ]; then
 
     if [ -d "/app/data/camila" ] && [ "$(ls -A /app/data/camila/*.xlsx 2>/dev/null)" ]; then
         echo "📁 Archivos de Camila encontrados, cargando..."
-        python /app/scripts/load_camila_data.py
+        python /app/scripts/load_camila_batch.py
         echo "✅ Datos de Camila cargados!"
     else
         echo "⚠️  No se encontraron archivos de Camila en /app/data/camila/"
