@@ -47,7 +47,12 @@ try:
     print('  ✓ Modelos de Camila importados')
 except Exception as e:
     print(f'  ✗ Error importando camila: {e}')
-
+try:
+    from app.models.container_dwell_time import ContainerDwellTime
+    from app.models.truck_turnaround_time import TruckTurnaroundTime
+    print('  ✓ CDT y TTT importados')
+except Exception as e:
+    print(f'  ✗ Error importando CDT/TTT: {e}')
 from app.core.config import get_settings
 
 async def create_tables():
@@ -82,7 +87,10 @@ asyncio.run(create_tables())
 sleep 2
 
 # Verificar si ya hay datos históricos
+# Verificar si ya hay datos históricos
 echo "🔍 Verificando datos históricos..."
+
+# Verificar movimientos históricos
 HISTORICAL_COUNT=$(python -c "
 import asyncio
 import sys
@@ -112,17 +120,130 @@ count = asyncio.run(count_records())
 print(count)
 " 2>/dev/null || echo "0")
 
-if [ "$HISTORICAL_COUNT" -eq "0" ]; then
-    echo "📊 No hay datos históricos, cargando archivo CSV..."
+# Verificar CDT
+CDT_COUNT=$(python -c "
+import asyncio
+import sys
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from app.models.container_dwell_time import ContainerDwellTime
+from app.core.config import get_settings
+
+async def count_records():
+    settings = get_settings()
+    engine = create_async_engine(settings.DATABASE_URL)
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    
+    try:
+        async with async_session() as db:
+            result = await db.execute(select(func.count(ContainerDwellTime.id)))
+            count = result.scalar()
+            return count
+    except Exception as e:
+        return 0
+    finally:
+        await engine.dispose()
+
+count = asyncio.run(count_records())
+print(count)
+" 2>/dev/null || echo "0")
+
+# Verificar TTT
+TTT_COUNT=$(python -c "
+import asyncio
+import sys
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from app.models.truck_turnaround_time import TruckTurnaroundTime
+from app.core.config import get_settings
+
+async def count_records():
+    settings = get_settings()
+    engine = create_async_engine(settings.DATABASE_URL)
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    
+    try:
+        async with async_session() as db:
+            result = await db.execute(select(func.count(TruckTurnaroundTime.id)))
+            count = result.scalar()
+            return count
+    except Exception as e:
+        return 0
+    finally:
+        await engine.dispose()
+
+count = asyncio.run(count_records())
+print(count)
+" 2>/dev/null || echo "0")
+
+echo "📊 Estado de datos:"
+echo "   - Movimientos históricos: $HISTORICAL_COUNT registros"
+echo "   - Container Dwell Time: $CDT_COUNT registros"
+echo "   - Truck Turnaround Time: $TTT_COUNT registros"
+
+# Determinar qué cargar
+LOAD_ALL=false
+if [ "$HISTORICAL_COUNT" -eq "0" ] || [ "$CDT_COUNT" -eq "0" ] || [ "$TTT_COUNT" -eq "0" ]; then
+    LOAD_ALL=true
+fi
+
+if [ "$LOAD_ALL" = true ]; then
+    echo ""
+    echo "📥 Faltan datos, verificando archivos disponibles..."
+    
+    # Verificar qué archivos existen
+    FILES_FOUND=false
     
     if [ -f "data/resultados_congestion_SAI_2022.csv" ]; then
-        python scripts/load_historical_data.py
-        echo "✅ Datos históricos cargados!"
+        echo "   ✓ Archivo de movimientos encontrado"
+        FILES_FOUND=true
     else
-        echo "⚠️  Archivo CSV no encontrado en data/resultados_congestion_SAI_2022.csv"
+        echo "   ✗ Archivo de movimientos no encontrado"
+    fi
+    
+    if [ -f "data/resultados_CDT_impo_anio_SAI_2022.csv" ]; then
+        echo "   ✓ Archivo CDT importación encontrado"
+        FILES_FOUND=true
+    else
+        echo "   ✗ Archivo CDT importación no encontrado"
+    fi
+    
+    if [ -f "data/resultados_CDT_expo_anio_SAI_2022.csv" ]; then
+        echo "   ✓ Archivo CDT exportación encontrado"
+        FILES_FOUND=true
+    else
+        echo "   ✗ Archivo CDT exportación no encontrado"
+    fi
+    
+    if [ -f "data/resultados_TTT_impo_anio_SAI_2022.csv" ]; then
+        echo "   ✓ Archivo TTT importación encontrado"
+        FILES_FOUND=true
+    else
+        echo "   ✗ Archivo TTT importación no encontrado"
+    fi
+    
+    if [ -f "data/resultados_TTT_expo_anio_SAI_2022.csv" ]; then
+        echo "   ✓ Archivo TTT exportación encontrado"
+        FILES_FOUND=true
+    else
+        echo "   ✗ Archivo TTT exportación no encontrado"
+    fi
+    
+    if [ "$FILES_FOUND" = true ]; then
+        echo ""
+        echo "🚀 Iniciando carga de datos..."
+        python scripts/load_historical_data.py --all
+        echo "✅ Proceso de carga completado!"
+    else
+        echo ""
+        echo "⚠️  No se encontraron archivos CSV en la carpeta data/"
+        echo "    Por favor, coloca los archivos CSV en la carpeta data/ antes de continuar"
     fi
 else
-    echo "✅ Ya existen $HISTORICAL_COUNT registros históricos"
+    echo ""
+    echo "✅ Todos los tipos de datos ya están cargados"
 fi
 
 # Verificar si ya hay datos de Magdalena
@@ -165,7 +286,7 @@ if [ "$MAGDALENA_COUNT" -eq "0" ]; then
 
     if [ -d "/app/data/magdalena" ] && [ "$(ls -A /app/data/magdalena/*.xlsx 2>/dev/null)" ]; then
         echo "📁 Archivos de Magdalena encontrados, cargando..."
-        python /app/scripts/load_magdalena_data.py
+        #python /app/scripts/load_magdalena_data.py
         echo "✅ Datos de Magdalena cargados!"
     else
         echo "⚠️  No se encontraron archivos de Magdalena en /app/data/magdalena/"
@@ -227,7 +348,7 @@ if [ "$CAMILA_COUNT" -eq "0" ]; then
 
     if [ -d "/app/data/camila" ] && [ "$(ls -A /app/data/camila/*.xlsx 2>/dev/null)" ]; then
         echo "📁 Archivos de Camila encontrados, cargando..."
-        python /app/scripts/load_camila_batch.py
+       # python /app/scripts/load_camila_data.py
         echo "✅ Datos de Camila cargados!"
     else
         echo "⚠️  No se encontraron archivos de Camila en /app/data/camila/"

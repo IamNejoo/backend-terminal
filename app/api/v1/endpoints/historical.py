@@ -3,12 +3,17 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, date, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func, or_
+from sqlalchemy import select, and_, func, or_, case
+from collections import defaultdict
 import hashlib
 import logging
+import statistics
+import numpy as np
 
 from app.core.database import get_db
 from app.models.historical_movements import HistoricalMovement
+from app.models.container_dwell_time import ContainerDwellTime
+from app.models.truck_turnaround_time import TruckTurnaroundTime
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -62,6 +67,27 @@ class InMemoryCache:
 # Instancia global del cache
 cache = InMemoryCache()
 
+# Funciones auxiliares
+def parse_dates(start_date: str, end_date: str):
+    """Parsear fechas con formato consistente"""
+    if 'T' not in start_date:
+        start_date = f"{start_date}T00:00:00"
+    if 'T' not in end_date:
+        end_date = f"{end_date}T23:59:59"
+    
+    start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+    end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+    
+    return start_dt, end_dt
+
+def calculate_percentile(values: List[float], percentile: float) -> float:
+    """Calcular percentil de una lista de valores"""
+    if not values:
+        return 0
+    sorted_values = sorted(values)
+    index = int(len(sorted_values) * percentile / 100)
+    return sorted_values[min(index, len(sorted_values) - 1)]
+
 @router.get("/movements")
 async def get_historical_movements(
     start_date: str = Query(..., description="Fecha inicio (YYYY-MM-DD o YYYY-MM-DDTHH:MM:SS)"),
@@ -88,13 +114,7 @@ async def get_historical_movements(
     
     try:
         # Parsear fechas
-        if 'T' not in start_date:
-            start_date = f"{start_date}T00:00:00"
-        if 'T' not in end_date:
-            end_date = f"{end_date}T23:59:59"
-            
-        start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-        end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+        start_dt, end_dt = parse_dates(start_date, end_date)
         
         # Calcular diferencia de días
         days_diff = (end_dt - start_dt).days
@@ -261,44 +281,41 @@ async def get_historical_movements(
         logger.error(f"Error en get_historical_movements: {str(e)}")
         raise HTTPException(500, f"Error interno: {str(e)}")
 
-@router.get("/kpis")
-async def calculate_kpis(
+@router.get("/kpis/comprehensive")
+async def get_comprehensive_kpis(
     start_date: str = Query(..., description="Fecha inicio (YYYY-MM-DD)"),
     end_date: str = Query(..., description="Fecha fin (YYYY-MM-DD)"),
     unit: str = Query("day", regex="^(hour|day|week|month|year)$"),
     patio_filter: Optional[str] = Query(None),
     bloque_filter: Optional[str] = Query(None),
+    operation_type: Optional[str] = Query(None, description="import/export para CDT/TTT"),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Calcular los 6 KPIs principales como en usePortKPIs
+    Obtener todos los KPIs integrados: Congestión + TTT + CDT + Inventario
     """
     # Verificar cache
     cached_data = cache.get(
-        endpoint="kpis",
+        endpoint="comprehensive_kpis",
         start_date=start_date,
         end_date=end_date,
         unit=unit,
         patio=patio_filter or "all",
-        bloque=bloque_filter or "all"
+        bloque=bloque_filter or "all",
+        operation=operation_type or "all"
     )
     
     if cached_data:
-        logger.info("KPIs obtenidos del cache")
+        logger.info("KPIs comprehensivos obtenidos del cache")
         return cached_data
     
     try:
-        if 'T' not in start_date:
-            start_date = f"{start_date}T00:00:00"
-        if 'T' not in end_date:
-            end_date = f"{end_date}T23:59:59"
-            
-        start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-        end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+        # Parsear fechas
+        start_dt, end_dt = parse_dates(start_date, end_date)
     except ValueError:
         raise HTTPException(400, "Formato de fecha inválido. Use YYYY-MM-DD")
     
-    # Obtener datos filtrados
+    # 1. OBTENER DATOS DE MOVIMIENTOS HISTÓRICOS
     query = select(HistoricalMovement).where(
         and_(
             HistoricalMovement.hora >= start_dt,
@@ -314,47 +331,79 @@ async def calculate_kpis(
         query = query.where(HistoricalMovement.bloque == bloque_filter)
     
     result = await db.execute(query)
-    data = result.scalars().all()
+    movements_data = result.scalars().all()
     
-    if not data:
-        kpis_result = {
-            'utilizacionPorVolumen': 0,
-            'congestionVehicular': 0,
-            'balanceFlujo': 1,
-            'productividadOperacional': 0,
-            'indiceRemanejo': 0,
-            'saturacionOperacional': 0,
-            'kpiRelations': {
-                'congestionProductividadStatus': 'normal',
-                'utilizacionRemanejosStatus': 'normal',
-                'balanceUtilizacionStatus': 'normal'
-            },
-            'detalles': {}
-        }
-        cache.set(kpis_result, expire_minutes=30, endpoint="kpis", **{
-            'start_date': start_date,
-            'end_date': end_date,
-            'unit': unit,
-            'patio': patio_filter or "all",
-            'bloque': bloque_filter or "all"
-        })
-        return kpis_result
+    # 2. OBTENER DATOS DE TTT
+    ttt_query = select(
+        func.avg(TruckTurnaroundTime.ttt).label('promedio'),
+        func.count(TruckTurnaroundTime.id).label('total'),
+        func.min(TruckTurnaroundTime.ttt).label('minimo'),
+        func.max(TruckTurnaroundTime.ttt).label('maximo')
+    ).where(
+        and_(
+            TruckTurnaroundTime.pregate_ss >= start_dt,
+            TruckTurnaroundTime.pregate_ss <= end_dt,
+            TruckTurnaroundTime.ttt > 0  # Excluir valores negativos
+        )
+    )
     
-    # 1. UTILIZACIÓN POR VOLUMEN
-    ocupacion_por_bloque = {}
-    data_by_bloque = {}
+    if operation_type:
+        ttt_query = ttt_query.where(TruckTurnaroundTime.operation_type == operation_type)
     
-    for movement in data:
-        if movement.bloque not in data_by_bloque:
-            data_by_bloque[movement.bloque] = []
-        data_by_bloque[movement.bloque].append(movement)
+    # Para obtener percentiles de TTT
+    ttt_values_query = select(TruckTurnaroundTime.ttt).where(
+        and_(
+            TruckTurnaroundTime.pregate_ss >= start_dt,
+            TruckTurnaroundTime.pregate_ss <= end_dt,
+            TruckTurnaroundTime.ttt > 0
+        )
+    )
     
-    for bloque, registros in data_by_bloque.items():
-        suma_teus = sum(r.promedio_teus for r in registros)
-        promedio_teus = suma_teus / len(registros) if registros else 0
-        ocupacion_por_bloque[bloque] = promedio_teus
+    if operation_type:
+        ttt_values_query = ttt_values_query.where(TruckTurnaroundTime.operation_type == operation_type)
     
-    # Calcular capacidad según filtros
+    ttt_result = await db.execute(ttt_query)
+    ttt_stats = ttt_result.first()
+    
+    ttt_values_result = await db.execute(ttt_values_query)
+    ttt_values = [row[0] for row in ttt_values_result if row[0] is not None]
+    
+    # 3. OBTENER DATOS DE CDT
+    cdt_query = select(
+        func.avg(ContainerDwellTime.cdt_hours).label('promedio_horas'),
+        func.count(ContainerDwellTime.id).label('total'),
+        func.min(ContainerDwellTime.cdt_hours).label('minimo'),
+        func.max(ContainerDwellTime.cdt_hours).label('maximo')
+    ).where(
+        and_(
+            ContainerDwellTime.iufv_it >= start_dt,
+            ContainerDwellTime.iufv_it <= end_dt,
+            ContainerDwellTime.cdt_hours.isnot(None)
+        )
+    )
+    
+    if operation_type:
+        cdt_query = cdt_query.where(ContainerDwellTime.operation_type == operation_type)
+    
+    # Para obtener percentiles de CDT
+    cdt_values_query = select(ContainerDwellTime.cdt_hours).where(
+        and_(
+            ContainerDwellTime.iufv_it >= start_dt,
+            ContainerDwellTime.iufv_it <= end_dt,
+            ContainerDwellTime.cdt_hours.isnot(None)
+        )
+    )
+    
+    if operation_type:
+        cdt_values_query = cdt_values_query.where(ContainerDwellTime.operation_type == operation_type)
+    
+    cdt_result = await db.execute(cdt_query)
+    cdt_stats = cdt_result.first()
+    
+    cdt_values_result = await db.execute(cdt_values_query)
+    cdt_values = [row[0] for row in cdt_values_result if row[0] is not None]
+    
+    # 4. CALCULAR KPIs DE CAPACIDAD Y OCUPACIÓN
     capacidad_filtrada = CAPACIDAD_TOTAL_TERMINAL
     if patio_filter and patio_filter in PATIO_BLOCKS:
         bloques_patio = PATIO_BLOCKS[patio_filter]
@@ -362,86 +411,69 @@ async def calculate_kpis(
     elif bloque_filter and bloque_filter in CAPACIDADES_BLOQUES:
         capacidad_filtrada = CAPACIDADES_BLOQUES[bloque_filter]
     
-    ocupacion_total = sum(ocupacion_por_bloque.values())
-    utilizacion_por_volumen = (ocupacion_total / capacidad_filtrada) * 100 if capacidad_filtrada > 0 else 0
+    # Usar los campos pre-calculados de promedio
+    promedios_teus = [m.promedio_teus for m in movements_data]
+    minimos_teus = [m.minimo_teus for m in movements_data]
+    maximos_teus = [m.maximos_teus for m in movements_data]
     
-    # 2. CONGESTIÓN VEHICULAR
-    movimientos_gate_por_hora = {}
-    for movement in data:
-        hora = movement.hora.strftime('%H')
-        if hora not in movimientos_gate_por_hora:
-            movimientos_gate_por_hora[hora] = 0
-        movimientos_gate_por_hora[hora] += (
-            movement.gate_entrada_contenedores + 
-            movement.gate_salida_contenedores
-        )
+    promedio_teus_actual = statistics.mean(promedios_teus) if promedios_teus else 0
+    minimo_teus_periodo = min(minimos_teus) if minimos_teus else 0
+    maximo_teus_periodo = max(maximos_teus) if maximos_teus else 0
     
-    horas_con_movimientos = len([m for m in movimientos_gate_por_hora.values() if m > 0])
-    total_movimientos_gate = sum(movimientos_gate_por_hora.values())
-    congestion_vehicular = (
-        total_movimientos_gate / horas_con_movimientos 
-        if horas_con_movimientos > 0 else 0
-    )
+    utilizacion_por_volumen = (promedio_teus_actual / capacidad_filtrada) * 100 if capacidad_filtrada > 0 else 0
     
-    # 3. BALANCE DE FLUJO
-    total_entradas = sum(
-        m.gate_entrada_contenedores + m.muelle_entrada_contenedores 
-        for m in data
-    )
-    total_salidas = sum(
-        m.gate_salida_contenedores + m.muelle_salida_contenedores 
-        for m in data
-    )
+    # Calcular variabilidad
+    if promedios_teus and len(promedios_teus) > 1:
+        std_dev = statistics.stdev(promedios_teus)
+        coef_variacion = (std_dev / promedio_teus_actual) * 100 if promedio_teus_actual > 0 else 0
+    else:
+        coef_variacion = 0
+    
+    # 5. CALCULAR KPIs DE FLUJO
+    total_gate_entrada = sum(m.gate_entrada_contenedores for m in movements_data)
+    total_gate_salida = sum(m.gate_salida_contenedores for m in movements_data)
+    total_muelle_entrada = sum(m.muelle_entrada_contenedores for m in movements_data)
+    total_muelle_salida = sum(m.muelle_salida_contenedores for m in movements_data)
+    total_remanejos = sum(m.remanejos_contenedores for m in movements_data)
+    
+    total_entradas = total_gate_entrada + total_muelle_entrada
+    total_salidas = total_gate_salida + total_muelle_salida
+    total_movimientos = total_entradas + total_salidas + total_remanejos
+    
     balance_flujo = total_entradas / total_salidas if total_salidas > 0 else 1
+    indice_remanejos = (total_remanejos / total_movimientos) * 100 if total_movimientos > 0 else 0
     
-    # 4. PRODUCTIVIDAD OPERACIONAL
-    total_movimientos_terminal = total_entradas + total_salidas
-    horas_unicas = len(set(m.hora for m in data))
-    productividad_operacional = (
-        total_movimientos_terminal / horas_unicas 
-        if horas_unicas > 0 else 0
-    )
+    # Gate throughput mejorado
+    horas_unicas = len(set(m.hora for m in movements_data))
+    gate_throughput = (total_gate_entrada + total_gate_salida) / horas_unicas if horas_unicas > 0 else 0
+    productividad_operacional = total_movimientos / horas_unicas if horas_unicas > 0 else 0
     
-    # 5. ÍNDICE DE REMANEJO
-    total_remanejos = sum(m.remanejos_contenedores for m in data)
-    total_movimientos = total_movimientos_terminal + total_remanejos
-    indice_remanejo = (
-        (total_remanejos / total_movimientos) * 100 
-        if total_movimientos > 0 else 0
-    )
+    # 6. CALCULAR SATURACIÓN MEJORADA
+    percentil_95_maximos = calculate_percentile(maximos_teus, 95)
+    saturacion_operacional = (promedio_teus_actual / percentil_95_maximos) * 100 if percentil_95_maximos > 0 else 0
     
-    # 6. SATURACIÓN OPERACIONAL
-    maximo_historico = max((m.maximos_teus for m in data), default=0)
-    promedio_actual = data[-1].promedio_teus if data else 0
-    saturacion_operacional = (
-        (promedio_actual / maximo_historico) * 100 
-        if maximo_historico > 0 else 0
-    )
-    
-    # CALCULAR RELACIONES ENTRE KPIs
+    # 7. CALCULAR RELACIONES ENTRE KPIs
     kpi_relations = {}
     
-    # 1. Relación Congestión-Productividad
-    if congestion_vehicular > productividad_operacional * 2:
+    # Relación Congestión-Productividad
+    if gate_throughput > productividad_operacional * 0.5:
         kpi_relations['congestionProductividadStatus'] = 'critical'
-    elif congestion_vehicular > productividad_operacional * 1.5:
+    elif gate_throughput > productividad_operacional * 0.4:
         kpi_relations['congestionProductividadStatus'] = 'warning'
-    elif congestion_vehicular < 30 and productividad_operacional < 50:
-        kpi_relations['congestionProductividadStatus'] = 'warning'  # Posible falta de recursos
     else:
         kpi_relations['congestionProductividadStatus'] = 'normal'
     
-    # 2. Relación Utilización-Remanejos
-    if utilizacion_por_volumen > 80 and indice_remanejo > 5:
+    # Relación Utilización-Remanejos
+    if utilizacion_por_volumen > 80 and indice_remanejos > 5:
         kpi_relations['utilizacionRemanejosStatus'] = 'critical'
-    elif utilizacion_por_volumen > 70 and indice_remanejo > 3:
+    elif utilizacion_por_volumen > 70 and indice_remanejos > 3:
         kpi_relations['utilizacionRemanejosStatus'] = 'warning'
-    elif utilizacion_por_volumen < 50 and indice_remanejo < 2:
+    elif utilizacion_por_volumen < 50 and indice_remanejos < 2:
         kpi_relations['utilizacionRemanejosStatus'] = 'good'
     else:
         kpi_relations['utilizacionRemanejosStatus'] = 'normal'
     
-    # 3. Relación Balance-Utilización
+    # Relación Balance-Utilización
     if balance_flujo > 1.3 and utilizacion_por_volumen > 80:
         kpi_relations['balanceUtilizacionStatus'] = 'critical'
     elif balance_flujo > 1.2 and utilizacion_por_volumen > 70:
@@ -451,56 +483,167 @@ async def calculate_kpis(
     else:
         kpi_relations['balanceUtilizacionStatus'] = 'normal'
     
-    kpis_result = {
-        'utilizacionPorVolumen': round(utilizacion_por_volumen, 2),
-        'congestionVehicular': round(congestion_vehicular, 2),
-        'balanceFlujo': round(balance_flujo, 2),
-        'productividadOperacional': round(productividad_operacional, 2),
-        'indiceRemanejo': round(indice_remanejo, 2),
-        'saturacionOperacional': round(saturacion_operacional, 2),
-        'kpiRelations': kpi_relations,  # AGREGAR ESTA LÍNEA
-        'detalles': {
-            'totalRegistros': len(data),
-            'rangoFechas': {
-                'inicio': start_dt.isoformat(),
-                'fin': end_dt.isoformat()
+    # 8. CONSTRUIR RESPUESTA COMPLETA
+    result = {
+        # KPIs de Capacidad y Ocupación
+        'capacidad': {
+            'utilizacionPorVolumen': round(utilizacion_por_volumen, 2),
+            'promedioTeus': round(promedio_teus_actual, 2),
+            'minimoTeus': minimo_teus_periodo,
+            'maximoTeus': maximo_teus_periodo,
+            'rangoOperativo': maximo_teus_periodo - minimo_teus_periodo,
+            'coeficienteVariacion': round(coef_variacion, 2),
+            'capacidadTotal': capacidad_filtrada,
+            'horasCriticas': len([p for p in promedios_teus if p > capacidad_filtrada * 0.85])
+        },
+        
+        # KPIs de Flujos y Productividad
+        'flujos': {
+            'gateEntrada': total_gate_entrada,
+            'gateSalida': total_gate_salida,
+            'gateThroughput': round(gate_throughput, 2),
+            'muelleEntrada': total_muelle_entrada,
+            'muelleSalida': total_muelle_salida,
+            'totalMovimientos': total_movimientos,
+            'balanceFlujo': round(balance_flujo, 2),
+            'indiceRemanejos': round(indice_remanejos, 2),
+            'productividadOperacional': round(productividad_operacional, 2)
+        },
+        
+        # KPIs de Tiempos de Servicio
+        'tiemposServicio': {
+            'ttt': {
+                'promedio': round(ttt_stats.promedio, 2) if ttt_stats and ttt_stats.promedio else 0,
+                'minimo': round(ttt_stats.minimo, 2) if ttt_stats and ttt_stats.minimo else 0,
+                'maximo': round(ttt_stats.maximo, 2) if ttt_stats and ttt_stats.maximo else 0,
+                'mediana': round(calculate_percentile(ttt_values, 50), 2) if ttt_values else 0,
+                'p90': round(calculate_percentile(ttt_values, 90), 2) if ttt_values else 0,
+                'p95': round(calculate_percentile(ttt_values, 95), 2) if ttt_values else 0,
+                'totalCamiones': ttt_stats.total if ttt_stats else 0
             },
-            'ocupacionPorBloque': ocupacion_por_bloque,
-            'horasConActividad': horas_con_movimientos,
-            'totalMovimientos': total_movimientos
+            'cdt': {
+                'promedioHoras': round(cdt_stats.promedio_horas, 2) if cdt_stats and cdt_stats.promedio_horas else 0,
+                'promedioDias': round(cdt_stats.promedio_horas / 24, 2) if cdt_stats and cdt_stats.promedio_horas else 0,
+                'minimo': round(cdt_stats.minimo / 24, 2) if cdt_stats and cdt_stats.minimo else 0,
+                'maximo': round(cdt_stats.maximo / 24, 2) if cdt_stats and cdt_stats.maximo else 0,
+                'mediana': round(calculate_percentile(cdt_values, 50) / 24, 2) if cdt_values else 0,
+                'p90': round(calculate_percentile(cdt_values, 90) / 24, 2) if cdt_values else 0,
+                'p95': round(calculate_percentile(cdt_values, 95) / 24, 2) if cdt_values else 0,
+                'totalContenedores': cdt_stats.total if cdt_stats else 0,
+                'criticos': len([c for c in cdt_values if c > 168])  # > 7 días
+            }
+        },
+        
+        # KPIs de Congestión
+        'congestion': {
+            'saturacionOperacional': round(saturacion_operacional, 2),
+            'percentil95Maximos': percentil_95_maximos,
+            'nivelInventario': 'critical' if utilizacion_por_volumen > 85 else 'warning' if utilizacion_por_volumen > 70 else 'normal',
+            'indiceFlujo': round(gate_throughput / percentil_95_maximos, 2) if percentil_95_maximos > 0 else 0
+        },
+        
+        # Relaciones entre KPIs
+        'kpiRelations': kpi_relations,
+        
+        # Metadata
+        'metadata': {
+            'periodo': {
+                'inicio': start_dt.isoformat(),
+                'fin': end_dt.isoformat(),
+                'granularidad': unit
+            },
+            'totalRegistros': len(movements_data),
+            'horasUnicas': horas_unicas,
+            'filtros': {
+                'patio': patio_filter,
+                'bloque': bloque_filter,
+                'operacion': operation_type
+            }
         }
     }
     
     # Guardar en cache
-    cache.set(kpis_result, expire_minutes=30, endpoint="kpis", **{
+    cache.set(result, expire_minutes=30, endpoint="comprehensive_kpis", **{
         'start_date': start_date,
         'end_date': end_date,
         'unit': unit,
         'patio': patio_filter or "all",
-        'bloque': bloque_filter or "all"
+        'bloque': bloque_filter or "all",
+        'operation': operation_type or "all"
     })
     
-    return kpis_result
+    return result
 
+@router.get("/kpis")
+async def calculate_kpis(
+    start_date: str = Query(..., description="Fecha inicio (YYYY-MM-DD)"),
+    end_date: str = Query(..., description="Fecha fin (YYYY-MM-DD)"),
+    unit: str = Query("day", regex="^(hour|day|week|month|year)$"),
+    patio_filter: Optional[str] = Query(None),
+    bloque_filter: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Calcular los 6 KPIs principales (versión legacy - mantener por compatibilidad)
+    Usar /kpis/comprehensive para obtener todos los KPIs integrados
+    """
+    # Redirigir al endpoint comprehensive pero devolver formato legacy
+    comprehensive_data = await get_comprehensive_kpis(
+        start_date=start_date,
+        end_date=end_date,
+        unit=unit,
+        patio_filter=patio_filter,
+        bloque_filter=bloque_filter,
+        operation_type=None,
+        db=db
+    )
+    
+    # Mapear al formato legacy
+    return {
+        'utilizacionPorVolumen': comprehensive_data['capacidad']['utilizacionPorVolumen'],
+        'congestionVehicular': comprehensive_data['flujos']['gateThroughput'],
+        'balanceFlujo': comprehensive_data['flujos']['balanceFlujo'],
+        'productividadOperacional': comprehensive_data['flujos']['productividadOperacional'],
+        'indiceRemanejo': comprehensive_data['flujos']['indiceRemanejos'],
+        'saturacionOperacional': comprehensive_data['congestion']['saturacionOperacional'],
+        'kpiRelations': comprehensive_data['kpiRelations'],
+        'detalles': {
+            'totalRegistros': comprehensive_data['metadata']['totalRegistros'],
+            'rangoFechas': comprehensive_data['metadata']['periodo'],
+            'ocupacionPorBloque': {},  # Se puede calcular si es necesario
+            'horasConActividad': comprehensive_data['metadata']['horasUnicas'],
+            'totalMovimientos': comprehensive_data['flujos']['totalMovimientos']
+        }
+    }
 
 @router.get("/summary")
 async def get_summary(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Obtener resumen de datos disponibles
+    Obtener resumen de datos disponibles incluyendo CDT y TTT
     """
     # Verificar cache
     cached_data = cache.get(endpoint="summary")
     if cached_data:
         return cached_data
     
-    # Contar registros totales
+    # Contar registros de movimientos
     count_query = select(func.count(HistoricalMovement.id))
     count_result = await db.execute(count_query)
-    total_records = count_result.scalar()
+    total_movements = count_result.scalar()
     
-    # Obtener rango de fechas
+    # Contar registros CDT
+    cdt_count_query = select(func.count(ContainerDwellTime.id))
+    cdt_count_result = await db.execute(cdt_count_query)
+    total_cdt = cdt_count_result.scalar()
+    
+    # Contar registros TTT
+    ttt_count_query = select(func.count(TruckTurnaroundTime.id))
+    ttt_count_result = await db.execute(ttt_count_query)
+    total_ttt = ttt_count_result.scalar()
+    
+    # Obtener rango de fechas de movimientos
     date_query = select(
         func.min(HistoricalMovement.hora),
         func.max(HistoricalMovement.hora)
@@ -514,10 +657,22 @@ async def get_summary(
     bloques = [b[0] for b in bloques_result.all()]
     
     summary_result = {
-        'totalRecords': total_records,
-        'dateRange': {
-            'start': min_date.isoformat() if min_date else None,
-            'end': max_date.isoformat() if max_date else None
+        'movements': {
+            'totalRecords': total_movements,
+            'dateRange': {
+                'start': min_date.isoformat() if min_date else None,
+                'end': max_date.isoformat() if max_date else None
+            }
+        },
+        'cdt': {
+            'totalRecords': total_cdt,
+            'import': 0,  # Se puede calcular con query adicional
+            'export': 0   # Se puede calcular con query adicional
+        },
+        'ttt': {
+            'totalRecords': total_ttt,
+            'import': 0,  # Se puede calcular con query adicional
+            'export': 0   # Se puede calcular con query adicional
         },
         'bloques': bloques,
         'patios': list(PATIO_BLOCKS.keys()),
