@@ -27,7 +27,105 @@ CAPACIDADES_BLOQUES = {
 }
 
 CAPACIDAD_TOTAL_TERMINAL = 16254
+def aggregate_inventory_stats(movements_data: List[HistoricalMovement], unit: str = "day") -> dict:
+    """
+    Calcula estadísticas de inventario basadas en los datos de movimientos históricos.
+    
+    Args:
+        movements_data: Lista de movimientos históricos
+        unit: Unidad de agregación temporal (hour, day, week, month, year)
+    
+    Returns:
+        dict: Estadísticas de inventario incluyendo min, max, promedio, percentiles, etc.
+    """
+    if not movements_data:
+        return {
+            'minimo': 0,
+            'maximo': 0,
+            'promedio': 0,
+            'rango': 0,
+            'variabilidad': 0,
+            'percentil_90': 0,
+            'percentil_95': 0
+        }
+    
+    # Extraer todos los valores de promedio de TEUs
+    promedios_teus = [m.promedio_teus for m in movements_data if m.promedio_teus is not None]
+    
+    if not promedios_teus:
+        return {
+            'minimo': 0,
+            'maximo': 0,
+            'promedio': 0,
+            'rango': 0,
+            'variabilidad': 0,
+            'percentil_90': 0,
+            'percentil_95': 0
+        }
+    
+    # Calcular estadísticas básicas
+    minimo = min(promedios_teus)
+    maximo = max(promedios_teus)
+    promedio = statistics.mean(promedios_teus)
+    rango = maximo - minimo
+    
+    # Calcular variabilidad (coeficiente de variación)
+    if len(promedios_teus) > 1 and promedio > 0:
+        std_dev = statistics.stdev(promedios_teus)
+        variabilidad = (std_dev / promedio) * 100
+    else:
+        variabilidad = 0
+    
+    # Calcular percentiles
+    percentil_90 = calculate_percentile(promedios_teus, 90)
+    percentil_95 = calculate_percentile(promedios_teus, 95)
+    
+    return {
+        'minimo': round(minimo, 2),
+        'maximo': round(maximo, 2),
+        'promedio': round(promedio, 2),
+        'rango': round(rango, 2),
+        'variabilidad': round(variabilidad, 2),
+        'percentil_90': round(percentil_90, 2),
+        'percentil_95': round(percentil_95, 2)
+    }
 
+
+def calculate_percentile(values: List[float], percentile: float) -> float:
+    """
+    Calcula el percentil de una lista de valores.
+    
+    Args:
+        values: Lista de valores numéricos
+        percentile: Percentil a calcular (0-100)
+    
+    Returns:
+        float: Valor del percentil
+    """
+    if not values:
+        return 0
+    
+    sorted_values = sorted(values)
+    n = len(sorted_values)
+    
+    # Caso especial para lista con un solo elemento
+    if n == 1:
+        return sorted_values[0]
+    
+    # Calcular índice del percentil
+    index = (percentile / 100) * (n - 1)
+    lower_index = int(index)
+    upper_index = min(lower_index + 1, n - 1)
+    
+    # Interpolación lineal si el índice no es entero
+    if lower_index == upper_index:
+        return sorted_values[lower_index]
+    
+    lower_value = sorted_values[lower_index]
+    upper_value = sorted_values[upper_index]
+    fraction = index - lower_index
+    
+    return lower_value + fraction * (upper_value - lower_value)
 PATIO_BLOCKS = {
     'costanera': ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9'],
     'ohiggins': ['H1', 'H2', 'H3', 'H4', 'H5'],
@@ -343,7 +441,8 @@ async def get_comprehensive_kpis(
         and_(
             TruckTurnaroundTime.pregate_ss >= start_dt,
             TruckTurnaroundTime.pregate_ss <= end_dt,
-            TruckTurnaroundTime.ttt > 0  # Excluir valores negativos
+            TruckTurnaroundTime.ttt > 0,  # Excluir valores negativos
+            TruckTurnaroundTime.ttt < 1440  # Excluir valores mayores a 24 horas
         )
     )
     
@@ -355,7 +454,8 @@ async def get_comprehensive_kpis(
         and_(
             TruckTurnaroundTime.pregate_ss >= start_dt,
             TruckTurnaroundTime.pregate_ss <= end_dt,
-            TruckTurnaroundTime.ttt > 0
+            TruckTurnaroundTime.ttt > 0,
+            TruckTurnaroundTime.ttt < 1440
         )
     )
     
@@ -378,7 +478,9 @@ async def get_comprehensive_kpis(
         and_(
             ContainerDwellTime.iufv_it >= start_dt,
             ContainerDwellTime.iufv_it <= end_dt,
-            ContainerDwellTime.cdt_hours.isnot(None)
+            ContainerDwellTime.cdt_hours.isnot(None),
+            ContainerDwellTime.cdt_hours > 0,  # Excluir valores negativos
+            ContainerDwellTime.cdt_hours < 720  # Excluir valores mayores a 30 días
         )
     )
     
@@ -390,7 +492,9 @@ async def get_comprehensive_kpis(
         and_(
             ContainerDwellTime.iufv_it >= start_dt,
             ContainerDwellTime.iufv_it <= end_dt,
-            ContainerDwellTime.cdt_hours.isnot(None)
+            ContainerDwellTime.cdt_hours.isnot(None),
+            ContainerDwellTime.cdt_hours > 0,
+            ContainerDwellTime.cdt_hours < 720
         )
     )
     
@@ -443,22 +547,49 @@ async def get_comprehensive_kpis(
     balance_flujo = total_entradas / total_salidas if total_salidas > 0 else 1
     indice_remanejos = (total_remanejos / total_movimientos) * 100 if total_movimientos > 0 else 0
     
-    # Gate throughput mejorado
+    # CORRECCIÓN COMPLETA: Congestión Vehicular calculada correctamente
+    # Calcular el total de movimientos en gates y las horas únicas con actividad
+    total_gate_movimientos = 0
+    horas_con_gate_set = set()
+    
+    for movement in movements_data:
+        mov_gate = movement.gate_entrada_contenedores + movement.gate_salida_contenedores
+        if mov_gate > 0:
+            total_gate_movimientos += mov_gate
+            horas_con_gate_set.add(movement.hora)
+    
+    horas_con_gate = len(horas_con_gate_set)
+    
+    # Calcular congestión como promedio de movimientos por hora activa
+    if horas_con_gate > 0:
+        congestion_vehicular = total_gate_movimientos / horas_con_gate
+    else:
+        congestion_vehicular = 0
+    
+    logger.info(f"Congestión calculada: {congestion_vehicular:.2f} cont/hora")
+    logger.info(f"Total movimientos gate: {total_gate_movimientos}")
+    logger.info(f"Horas con actividad en gate: {horas_con_gate}")
+    
+    # Productividad operacional
     horas_unicas = len(set(m.hora for m in movements_data))
-    gate_throughput = (total_gate_entrada + total_gate_salida) / horas_unicas if horas_unicas > 0 else 0
     productividad_operacional = total_movimientos / horas_unicas if horas_unicas > 0 else 0
     
-    # 6. CALCULAR SATURACIÓN MEJORADA
-    percentil_95_maximos = calculate_percentile(maximos_teus, 95)
-    saturacion_operacional = (promedio_teus_actual / percentil_95_maximos) * 100 if percentil_95_maximos > 0 else 0
+    # 6. MÉTRICAS DE INVENTARIO (Reemplaza Saturación Operacional)
+    inventario_stats = aggregate_inventory_stats(movements_data, unit)
+    
+    # Calcular índice de estabilidad del inventario
+    if inventario_stats['promedio'] > 0:
+        estabilidad_inventario = 100 - inventario_stats['variabilidad']
+    else:
+        estabilidad_inventario = 0
     
     # 7. CALCULAR RELACIONES ENTRE KPIs
     kpi_relations = {}
     
-    # Relación Congestión-Productividad
-    if gate_throughput > productividad_operacional * 0.5:
+    # Relación Congestión-Productividad (corregida)
+    if congestion_vehicular > productividad_operacional * 0.5:
         kpi_relations['congestionProductividadStatus'] = 'critical'
-    elif gate_throughput > productividad_operacional * 0.4:
+    elif congestion_vehicular > productividad_operacional * 0.4:
         kpi_relations['congestionProductividadStatus'] = 'warning'
     else:
         kpi_relations['congestionProductividadStatus'] = 'normal'
@@ -483,6 +614,15 @@ async def get_comprehensive_kpis(
     else:
         kpi_relations['balanceUtilizacionStatus'] = 'normal'
     
+    # Nueva relación: TTT vs Congestión
+    if ttt_stats and ttt_stats.promedio:
+        if ttt_stats.promedio > 90 and congestion_vehicular < 30:
+            kpi_relations['tttCongestionStatus'] = 'warning'  # TTT alto sin congestión = ineficiencia
+        elif ttt_stats.promedio < 30 and congestion_vehicular > 50:
+            kpi_relations['tttCongestionStatus'] = 'good'  # Manejo eficiente a pesar de congestión
+        else:
+            kpi_relations['tttCongestionStatus'] = 'normal'
+    
     # 8. CONSTRUIR RESPUESTA COMPLETA
     result = {
         # KPIs de Capacidad y Ocupación
@@ -497,11 +637,25 @@ async def get_comprehensive_kpis(
             'horasCriticas': len([p for p in promedios_teus if p > capacidad_filtrada * 0.85])
         },
         
+        # KPIs de Inventario (NUEVO - Reemplaza Saturación)
+        'inventario': {
+            'minimo': inventario_stats['minimo'],
+            'maximo': inventario_stats['maximo'],
+            'promedio': inventario_stats['promedio'],
+            'rango': inventario_stats['rango'],
+            'variabilidad': inventario_stats['variabilidad'],
+            'estabilidad': round(estabilidad_inventario, 2),
+            'percentil90': inventario_stats['percentil_90'],
+            'percentil95': inventario_stats['percentil_95'],
+            'utilizacionPico': round((inventario_stats['percentil_95'] / capacidad_filtrada) * 100, 2) if capacidad_filtrada > 0 else 0
+        },
+        
         # KPIs de Flujos y Productividad
         'flujos': {
             'gateEntrada': total_gate_entrada,
             'gateSalida': total_gate_salida,
-            'gateThroughput': round(gate_throughput, 2),
+            'congestionVehicular': round(congestion_vehicular, 2),  # CORREGIDO
+            'horasConGate': horas_con_gate,
             'muelleEntrada': total_muelle_entrada,
             'muelleSalida': total_muelle_salida,
             'totalMovimientos': total_movimientos,
@@ -519,7 +673,8 @@ async def get_comprehensive_kpis(
                 'mediana': round(calculate_percentile(ttt_values, 50), 2) if ttt_values else 0,
                 'p90': round(calculate_percentile(ttt_values, 90), 2) if ttt_values else 0,
                 'p95': round(calculate_percentile(ttt_values, 95), 2) if ttt_values else 0,
-                'totalCamiones': ttt_stats.total if ttt_stats else 0
+                'totalCamiones': ttt_stats.total if ttt_stats else 0,
+                'camionesEficientes': len([v for v in ttt_values if v < 60]) if ttt_values else 0
             },
             'cdt': {
                 'promedioHoras': round(cdt_stats.promedio_horas, 2) if cdt_stats and cdt_stats.promedio_horas else 0,
@@ -534,14 +689,6 @@ async def get_comprehensive_kpis(
             }
         },
         
-        # KPIs de Congestión
-        'congestion': {
-            'saturacionOperacional': round(saturacion_operacional, 2),
-            'percentil95Maximos': percentil_95_maximos,
-            'nivelInventario': 'critical' if utilizacion_por_volumen > 85 else 'warning' if utilizacion_por_volumen > 70 else 'normal',
-            'indiceFlujo': round(gate_throughput / percentil_95_maximos, 2) if percentil_95_maximos > 0 else 0
-        },
-        
         # Relaciones entre KPIs
         'kpiRelations': kpi_relations,
         
@@ -550,7 +697,8 @@ async def get_comprehensive_kpis(
             'periodo': {
                 'inicio': start_dt.isoformat(),
                 'fin': end_dt.isoformat(),
-                'granularidad': unit
+                'granularidad': unit,
+                'diasAnalizados': (end_dt - start_dt).days + 1
             },
             'totalRegistros': len(movements_data),
             'horasUnicas': horas_unicas,
@@ -558,6 +706,11 @@ async def get_comprehensive_kpis(
                 'patio': patio_filter,
                 'bloque': bloque_filter,
                 'operacion': operation_type
+            },
+            'calidad': {
+                'completitudMovimientos': round((len(movements_data) / (horas_unicas * 18)) * 100, 2) if horas_unicas > 0 else 0,
+                'registrosTTT': ttt_stats.total if ttt_stats else 0,
+                'registrosCDT': cdt_stats.total if cdt_stats else 0
             }
         }
     }
