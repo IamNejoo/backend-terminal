@@ -270,11 +270,11 @@ async def get_historical_movements(
             ).order_by(date_trunc)
             
             # Aplicar filtros
-            if patio and patio in PATIO_BLOCKS:
+            if bloque:
+                query = query.where(HistoricalMovement.bloque == bloque)
+            elif patio and patio in PATIO_BLOCKS:
                 bloques_patio = PATIO_BLOCKS[patio]
                 query = query.where(HistoricalMovement.bloque.in_(bloques_patio))
-            elif bloque:
-                query = query.where(HistoricalMovement.bloque == bloque)
             
             result = await db.execute(query)
             rows = result.all()
@@ -321,11 +321,11 @@ async def get_historical_movements(
             ).order_by(HistoricalMovement.hora).limit(1000)  # Limitar a 1000
             
             # Aplicar filtros
-            if patio and patio in PATIO_BLOCKS:
+            if bloque:
+                query = query.where(HistoricalMovement.bloque == bloque)
+            elif patio and patio in PATIO_BLOCKS:
                 bloques_patio = PATIO_BLOCKS[patio]
                 query = query.where(HistoricalMovement.bloque.in_(bloques_patio))
-            elif bloque:
-                query = query.where(HistoricalMovement.bloque == bloque)
             
             result = await db.execute(query)
             movements = result.scalars().all()

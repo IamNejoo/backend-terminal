@@ -28,6 +28,14 @@ try:
     print('  ✓ Historical movements importado')
 except Exception as e:
     print(f'  ✗ Error importando historical_movements: {e}')
+try:
+    from app.models.sai_flujos import (
+        SAIConfiguration, SAIFlujo, SAIVolumenBloque, SAIVolumenSegregacion,
+        SAISegregacion, SAICapacidadBloque, SAIMapeoCriterios
+    )
+    print('  ✓ Modelos de SAI Flujos importados')
+except Exception as e:
+    print(f'  ✗ Error importando sai_flujos: {e}')
 
 try:
     from app.models.magdalena import (
@@ -87,7 +95,6 @@ asyncio.run(create_tables())
 sleep 2
 
 # Verificar si ya hay datos históricos
-# Verificar si ya hay datos históricos
 echo "🔍 Verificando datos históricos..."
 
 # Verificar movimientos históricos
@@ -119,6 +126,65 @@ async def count_records():
 count = asyncio.run(count_records())
 print(count)
 " 2>/dev/null || echo "0")
+
+# Verificar si ya hay datos de SAI Flujos
+echo "🔍 Verificando datos de SAI Flujos..."
+SAI_COUNT=$(python -c "
+import asyncio
+import sys
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from app.models.sai_flujos import SAIConfiguration
+from app.core.config import get_settings
+
+async def count_records():
+    settings = get_settings()
+    engine = create_async_engine(settings.DATABASE_URL)
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    
+    try:
+        async with async_session() as db:
+            result = await db.execute(select(func.count(SAIConfiguration.id)))
+            count = result.scalar()
+            return count
+    except Exception as e:
+        print(f'Error: {e}', file=sys.stderr)
+        return 0
+    finally:
+        await engine.dispose()
+
+count = asyncio.run(count_records())
+print(count)
+" 2>/dev/null || echo "0")
+
+if [ "$SAI_COUNT" -eq "0" ]; then
+    echo "📊 No hay datos de SAI, verificando archivos..."
+
+    echo "Contenido de /app/data/magdalena/2022/instancias_magdalena:"
+    ls -l /app/data/magdalena/2022/instancias_magdalena 2>/dev/null || echo "No existe el directorio"
+
+    if [ -d "/app/data/magdalena/2022/instancias_magdalena" ]; then
+        echo "📁 Buscando archivos SAI en estructura compartida..."
+        
+        # Verificar si hay archivos de flujos
+        if find /app/data/magdalena/2022/instancias_magdalena -name "Flujos_w*.xlsx" -type f | grep -q .; then
+            echo "📁 Archivos de SAI encontrados, cargando..."
+            python /app/scripts/load_sai_data.py
+            echo "✅ Datos de SAI cargados!"
+        else
+            echo "⚠️  No se encontraron archivos de SAI"
+        fi
+    else
+        echo "⚠️  No se encontró la estructura de directorios esperada"
+        echo "    Estructura esperada:"
+        echo "    - /app/data/magdalena/2022/instancias_magdalena/2022-01-03/Flujos_w*.xlsx"
+        echo "    - /app/data/magdalena/2022/instancias_magdalena/2022-01-03/Instancia_*.xlsx"
+        echo "    - /app/data/magdalena/2022/instancias_magdalena/2022-01-03/evolucion_turnos_*.xlsx"
+    fi
+else
+    echo "✅ Ya existen $SAI_COUNT configuraciones de SAI"
+fi
 
 # Verificar CDT
 CDT_COUNT=$(python -c "
@@ -234,7 +300,7 @@ if [ "$LOAD_ALL" = true ]; then
     if [ "$FILES_FOUND" = true ]; then
         echo ""
         echo "🚀 Iniciando carga de datos..."
-        python scripts/load_historical_data.py --all
+         python scripts/load_historical_data.py --all
         echo "✅ Proceso de carga completado!"
     else
         echo ""
@@ -348,7 +414,7 @@ if [ "$CAMILA_COUNT" -eq "0" ]; then
 
     if [ -d "/app/data/camila" ] && [ "$(ls -A /app/data/camila/*.xlsx 2>/dev/null)" ]; then
         echo "📁 Archivos de Camila encontrados, cargando..."
-       # python /app/scripts/load_camila_data.py
+    # python /app/scripts/load_camila_data.py
         echo "✅ Datos de Camila cargados!"
     else
         echo "⚠️  No se encontraron archivos de Camila en /app/data/camila/"
