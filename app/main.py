@@ -13,14 +13,16 @@ app = FastAPI(
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
 )
 
-# Configure CORS
+# Configure CORS - Agregar todas las posibles URLs del frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "http://127.0.0.1:5173",  # Agregar esta línea
+        "http://127.0.0.1:5173",
         "http://localhost:3000",
-        "http://127.0.0.1:3000"
+        "http://127.0.0.1:3000",
+        "http://localhost",
+        "http://127.0.0.1"
     ],
     allow_credentials=True,
     allow_methods=["*"],

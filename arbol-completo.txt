@@ -1,0 +1,213 @@
+
+├── .dockerignore
+├── .env
+├── .git
+├── .gitignore
+├── Dockerfile
+├── README.md
+├── app
+│   ├── __pycache__
+│   │   └── main.cpython-311.pyc
+│   ├── api
+│   │   ├── __init__.py
+│   │   ├── __pycache__
+│   │   │   └── __init__.cpython-311.pyc
+│   │   └── v1
+│   │       ├── __init__.py
+│   │       ├── __pycache__
+│   │       │   ├── __init__.cpython-311.pyc
+│   │       │   └── router.cpython-311.pyc
+│   │       ├── endpoints
+│   │       │   ├── __init__.py
+│   │       │   ├── __pycache__
+│   │       │   ├── camila.py
+│   │       │   ├── historical.py
+│   │       │   ├── magdalena.py
+│   │       │   └── sai_flujos.py
+│   │       └── router.py
+│   ├── core
+│   │   ├── __pycache__
+│   │   │   ├── config.cpython-311.pyc
+│   │   │   ├── constants.cpython-311.pyc
+│   │   │   ├── database.cpython-311.pyc
+│   │   │   └── database.cpython-312.pyc
+│   │   ├── config.py
+│   │   ├── constants.py
+│   │   └── database.py
+│   ├── main.py
+│   ├── models
+│   │   ├── __init__.py
+│   │   ├── __pycache__
+│   │   │   ├── __init__.cpython-311.pyc
+│   │   │   ├── base.cpython-311.pyc
+│   │   │   ├── camila.cpython-311.pyc
+│   │   │   ├── container_dwell_time.cpython-311.pyc
+│   │   │   ├── historical_movements.cpython-311.pyc
+│   │   │   ├── magdalena.cpython-311.pyc
+│   │   │   ├── sai_flujos.cpython-311.pyc
+│   │   │   └── truck_turnaround_time.cpython-311.pyc
+│   │   ├── base.py
+│   │   ├── camila.py
+│   │   ├── container_dwell_time.py
+│   │   ├── historical_movements.py
+│   │   ├── magdalena.py
+│   │   ├── sai_flujos.py
+│   │   └── truck_turnaround_time.py
+│   ├── schemas
+│   │   ├── __init__.py
+│   │   ├── __pycache__
+│   │   │   ├── __init__.cpython-311.pyc
+│   │   │   ├── camila.cpython-311.pyc
+│   │   │   └── sai_flujos.cpython-311.pyc
+│   │   ├── camila.py
+│   │   └── sai_flujos.py
+│   ├── services
+│   │   ├── __init__.py
+│   │   ├── __pycache__
+│   │   │   ├── __init__.cpython-311.pyc
+│   │   │   ├── camila_loader.cpython-311.pyc
+│   │   │   ├── csv_loader.cpython-311.pyc
+│   │   │   ├── magdalena_loader.cpython-311.pyc
+│   │   │   └── sai_flujos_loader.cpython-311.pyc
+│   │   ├── camila_loader.py
+│   │   ├── csv_loader.py
+│   │   ├── magdalena_loader.py
+│   │   └── sai_flujos_loader.py
+│   ├── tasks
+│   │   └── __init__.py
+│   └── utils
+│       └── __init__.py
+├── arbol-completo.txt
+├── bfg-1.14.0.jar
+├── bfg-patterns.txt
+├── data
+│   ├── camila
+│   ├── magdalena
+│   │   └── 2022
+│   │       ├── instancias_magdalena
+│   │       │   ├── 2022-01-03
+│   │       │   ├── 2022-01-10
+│   │       │   ├── 2022-01-17
+│   │       │   ├── 2022-01-24
+│   │       │   ├── 2022-01-31
+│   │       │   ├── 2022-02-07
+│   │       │   ├── 2022-02-14
+│   │       │   ├── 2022-02-21
+│   │       │   ├── 2022-02-28
+│   │       │   ├── 2022-03-07
+│   │       │   ├── 2022-03-14
+│   │       │   ├── 2022-03-21
+│   │       │   ├── 2022-03-28
+│   │       │   ├── 2022-04-04
+│   │       │   ├── 2022-04-11
+│   │       │   ├── 2022-04-18
+│   │       │   ├── 2022-04-25
+│   │       │   ├── 2022-05-02
+│   │       │   ├── 2022-05-09
+│   │       │   ├── 2022-05-16
+│   │       │   ├── 2022-05-23
+│   │       │   ├── 2022-05-30
+│   │       │   ├── 2022-06-06
+│   │       │   ├── 2022-06-13
+│   │       │   ├── 2022-06-20
+│   │       │   ├── 2022-06-27
+│   │       │   ├── 2022-07-04
+│   │       │   ├── 2022-07-11
+│   │       │   ├── 2022-07-18
+│   │       │   ├── 2022-07-25
+│   │       │   ├── 2022-08-01
+│   │       │   ├── 2022-08-08
+│   │       │   ├── 2022-08-15
+│   │       │   ├── 2022-08-22
+│   │       │   ├── 2022-08-29
+│   │       │   ├── 2022-09-05
+│   │       │   ├── 2022-09-12
+│   │       │   ├── 2022-09-19
+│   │       │   ├── 2022-09-26
+│   │       │   ├── 2022-10-03
+│   │       │   ├── 2022-10-10
+│   │       │   ├── 2022-10-17
+│   │       │   ├── 2022-10-24
+│   │       │   ├── 2022-10-31
+│   │       │   ├── 2022-11-07
+│   │       │   ├── 2022-11-14
+│   │       │   ├── 2022-11-21
+│   │       │   ├── 2022-11-28
+│   │       │   ├── 2022-12-05
+│   │       │   ├── 2022-12-12
+│   │       │   ├── 2022-12-19
+│   │       │   ├── 2022-12-26
+│   │       │   └── resultados_magdalena
+│   │       └── resultados_magdalena
+│   │           ├── 2022-01-03
+│   │           ├── 2022-01-10
+│   │           ├── 2022-01-17
+│   │           ├── 2022-01-24
+│   │           ├── 2022-01-31
+│   │           ├── 2022-02-07
+│   │           ├── 2022-02-14
+│   │           ├── 2022-02-21
+│   │           ├── 2022-02-28
+│   │           ├── 2022-03-07
+│   │           ├── 2022-03-14
+│   │           ├── 2022-03-21
+│   │           ├── 2022-03-28
+│   │           ├── 2022-04-04
+│   │           ├── 2022-04-11
+│   │           ├── 2022-04-18
+│   │           ├── 2022-04-25
+│   │           ├── 2022-05-02
+│   │           ├── 2022-05-09
+│   │           ├── 2022-05-16
+│   │           ├── 2022-05-23
+│   │           ├── 2022-05-30
+│   │           ├── 2022-06-06
+│   │           ├── 2022-06-13
+│   │           ├── 2022-06-20
+│   │           ├── 2022-06-27
+│   │           ├── 2022-07-04
+│   │           ├── 2022-07-11
+│   │           ├── 2022-07-18
+│   │           ├── 2022-07-25
+│   │           ├── 2022-08-01
+│   │           ├── 2022-08-08
+│   │           ├── 2022-08-15
+│   │           ├── 2022-08-22
+│   │           ├── 2022-08-29
+│   │           ├── 2022-09-05
+│   │           ├── 2022-09-12
+│   │           ├── 2022-09-19
+│   │           ├── 2022-09-26
+│   │           ├── 2022-10-03
+│   │           ├── 2022-10-10
+│   │           ├── 2022-10-17
+│   │           ├── 2022-10-24
+│   │           ├── 2022-10-31
+│   │           ├── 2022-11-07
+│   │           ├── 2022-11-14
+│   │           ├── 2022-11-21
+│   │           ├── 2022-11-28
+│   │           ├── 2022-12-05
+│   │           ├── 2022-12-12
+│   │           ├── 2022-12-19
+│   │           └── 2022-12-26
+│   ├── resultados_CDT_expo_anio_SAI_2022.csv
+│   ├── resultados_CDT_impo_anio_SAI_2022.csv
+│   ├── resultados_TTT_expo_anio_SAI_2022.csv
+│   ├── resultados_TTT_impo_anio_SAI_2022.csv
+│   ├── resultados_congestion_SAI_2022.csv
+│   └── sai
+├── docker
+├── docker-compose.yml
+├── migrations
+├── package-lock.json
+├── requirements.txt
+└── scripts
+    ├── docker-entrypoint.sh
+    ├── init_db.py
+    ├── load_camila_batch.py
+    ├── load_camila_data.py
+    ├── load_historical_data.py
+    ├── load_magdalena_data.py
+    ├── load_sai_data.py
+    └── test_connection.py
