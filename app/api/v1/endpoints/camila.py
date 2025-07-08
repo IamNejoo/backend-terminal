@@ -1,7 +1,7 @@
 # app/api/v1/endpoints/camila.py
 from typing import List, Optional, Dict, Any
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func, delete, or_
 import numpy as np
@@ -11,51 +11,90 @@ import os
 from uuid import UUID
 
 from app.core.database import get_db
-from app.core.constants import (
-    BLOCKS_INTERNAL, BLOCKS_DISPLAY, GRUAS, GRUA_PRODUCTIVITY,
-    TIME_PERIODS, SHIFTS, FLOW_TYPES, get_block_index, get_grua_index
+from app.models.camila import (
+    CamilaRun, CamilaVariable, CamilaParametro, CamilaMetrica, CamilaSegregacion
 )
-from app.models.camila import CamilaRun, CamilaFlujos, CamilaGruas, CamilaRealData
+from app.schemas.camila import (
+    CamilaConfigInput, CamilaResults, CamilaRunSummary, HealthCheck,
+    VariableInfo, VariablesSummary, MetricasBloque, MetricasGrua,
+    MetricasTiempo, MetricasSegregacion, GruaTimeline, BlockDetail,
+    ModelComparison, UploadResponse, CamilaFilter, PaginationParams,
+    CamilaRunsResponse
+)
 from app.services.camila_loader import CamilaLoader
+
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-@router.get("/health")
-async def health_check():
+@router.get("/health", response_model=HealthCheck)
+async def health_check(db: AsyncSession = Depends(get_db)):
     """Verificar estado del servicio"""
-    return {"status": "healthy", "service": "camila"}
+    try:
+        # Contar runs
+        count_result = await db.execute(select(func.count(CamilaRun.id)))
+        total_runs = count_result.scalar() or 0
+        
+        # Última actualización
+        last_update_result = await db.execute(
+            select(func.max(CamilaRun.fecha_carga))
+        )
+        last_update = last_update_result.scalar()
+        
+        return HealthCheck(
+            status="healthy",
+            service="camila",
+            version="2.0",
+            tables_exist=True,
+            total_runs=total_runs,
+            last_update=last_update
+        )
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return HealthCheck(
+            status="error",
+            service="camila",
+            version="2.0",
+            tables_exist=False,
+            total_runs=0,
+            last_update=None
+        )
 
 @router.get("/configurations")
 async def get_available_configurations(db: AsyncSession = Depends(get_db)):
     """Obtener todas las configuraciones disponibles"""
-    query = select(
-        CamilaRun.semana,
-        CamilaRun.dia,
-        CamilaRun.turno,
-        CamilaRun.modelo_tipo,
-        CamilaRun.con_segregaciones,
-        CamilaRun.total_movimientos,
-        CamilaRun.balance_workload
-    ).distinct()
-    
-    result = await db.execute(query)
-    configurations = result.all()
-    
-    return [
-        {
-            "week": c.semana,
-            "day": c.dia,
-            "shift": c.turno,
-            "modelType": c.modelo_tipo,
-            "withSegregations": c.con_segregaciones,
-            "totalMovements": c.total_movimientos or 0,
-            "workloadBalance": c.balance_workload or 0
-        }
-        for c in configurations
-    ]
+    try:
+        query = select(CamilaRun).order_by(
+            CamilaRun.semana,
+            CamilaRun.dia,
+            CamilaRun.turno
+        )
+        
+        result = await db.execute(query)
+        runs = result.scalars().all()
+        
+        configurations = []
+        for run in runs:
+            configurations.append({
+                "week": run.semana,
+                "day": run.dia,
+                "shift": run.turno,
+                "modelType": run.modelo_tipo,
+                "withSegregations": run.con_segregaciones,
+                "totalMovements": run.total_movimientos,
+                "workloadBalance": run.balance_workload,
+                "objectiveValue": run.funcion_objetivo,
+                "runId": str(run.id)
+            })
+        
+        logger.info(f"Configuraciones encontradas: {len(configurations)}")
+        return configurations
+        
+    except Exception as e:
+        logger.error(f"Error obteniendo configuraciones: {str(e)}")
+        raise HTTPException(500, f"Error al obtener configuraciones: {str(e)}")
 
-@router.get("/results")
-async def get_camila_metrics(
+@router.get("/results", response_model=CamilaResults)
+async def get_camila_results(
     semana: int = Query(..., ge=1, le=52),
     dia: str = Query(...),
     turno: int = Query(..., ge=1, le=3),
@@ -63,7 +102,7 @@ async def get_camila_metrics(
     con_segregaciones: bool = Query(True),
     db: AsyncSession = Depends(get_db)
 ):
-    """Obtener métricas completas de Camila"""
+    """Obtener resultados completos del modelo"""
     
     try:
         # Buscar el run
@@ -83,493 +122,469 @@ async def get_camila_metrics(
         if not run:
             raise HTTPException(404, "No se encontraron datos para esta configuración")
         
-        # Obtener flujos
-        flujos_query = select(CamilaFlujos).where(CamilaFlujos.run_id == run.id)
-        flujos_result = await db.execute(flujos_query)
-        flujos_data = flujos_result.scalars().all()
-        
-        # Obtener grúas
-        gruas_query = select(CamilaGruas).where(CamilaGruas.run_id == run.id)
-        gruas_result = await db.execute(gruas_query)
-        gruas_data = gruas_result.scalars().all()
-        
-        # Obtener datos reales si existen
-        real_query = select(CamilaRealData).where(CamilaRealData.run_id == run.id)
-        real_result = await db.execute(real_query)
-        real_data_db = real_result.scalars().all()
-        
-        # Inicializar matrices
-        reception_flow = np.zeros((9, 8))
-        delivery_flow = np.zeros((9, 8))
-        loading_flow = np.zeros((9, 8))
-        unloading_flow = np.zeros((9, 8))
-        total_flows_matrix = np.zeros((9, 8))
-        
-        # Procesar flujos
-        for flujo in flujos_data:
-            try:
-                b_idx = get_block_index(flujo.bloque)
-                t_idx = flujo.tiempo - 1
-                
-                if 0 <= b_idx < 9 and 0 <= t_idx < 8:
-                    if flujo.variable == 'fr_sbt':
-                        reception_flow[b_idx][t_idx] = flujo.valor
-                    elif flujo.variable == 'fe_sbt':
-                        delivery_flow[b_idx][t_idx] = flujo.valor
-                    elif flujo.variable == 'fc_sbt':
-                        loading_flow[b_idx][t_idx] = flujo.valor
-                    elif flujo.variable == 'fd_sbt':
-                        unloading_flow[b_idx][t_idx] = flujo.valor
-                    
-                    total_flows_matrix[b_idx][t_idx] += flujo.valor
-            except Exception as e:
-                logger.warning(f"Error procesando flujo {flujo.bloque}: {e}")
-                continue
-        
-        # CRÍTICO: Calcular block_participation
-        block_totals = np.sum(total_flows_matrix, axis=1)
-        total_movements = np.sum(block_totals)
-        
-        if total_movements > 0:
-            block_participation = (block_totals / total_movements * 100).tolist()
-        else:
-            block_participation = [0.0] * 9
-        
-        # CRÍTICO: Calcular time_participation
-        time_totals = np.sum(total_flows_matrix, axis=0)
-        
-        if total_movements > 0:
-            time_participation = (time_totals / total_movements * 100).tolist()
-        else:
-            time_participation = [0.0] * 8
-        
-        # Calcular estadísticas
-        std_dev_blocks = float(np.std(block_totals))
-        std_dev_time = float(np.std(time_totals))
-        
-        # Calcular workload balance
-        avg_block = np.mean(block_totals)
-        workload_balance = 100.0
-        if avg_block > 0:
-            cv = (std_dev_blocks / avg_block) * 100
-            workload_balance = max(0, 100 - cv)
-        
-        # Calcular congestion index
-        max_flow = float(np.max(block_totals)) if len(block_totals) > 0 else 0
-        congestion_index = 1.0
-        if avg_block > 0:
-            congestion_index = max_flow / avg_block
-        
-        # Procesar asignación de grúas
-        grue_assignment = [[0 for _ in range(72)] for _ in range(12)]
-        
-        for grua_record in gruas_data:
-            if grua_record.valor == 1:
-                try:
-                    g_idx = get_grua_index(grua_record.grua)
-                    b_idx = get_block_index(grua_record.bloque)
-                    t_idx = grua_record.tiempo - 1
-                    
-                    if 0 <= g_idx < 12 and 0 <= b_idx < 9 and 0 <= t_idx < 8:
-                        index = b_idx * 8 + t_idx
-                        grue_assignment[g_idx][index] = 1
-                except Exception as e:
-                    logger.warning(f"Error procesando grúa {grua_record.grua}: {e}")
-                    continue
-        
-        # Calcular capacidad basada en grúas
-        capacity_matrix = np.zeros((9, 8))
-        for b in range(9):
-            for t in range(8):
-                gruas_en_bloque = 0
-                for g in range(12):
-                    if grue_assignment[g][b * 8 + t] == 1:
-                        gruas_en_bloque += 1
-                capacity_matrix[b][t] = gruas_en_bloque * GRUA_PRODUCTIVITY
-        
-        # Calcular disponibilidad
-        availability_matrix = np.maximum(0, capacity_matrix - total_flows_matrix)
-        
-        # Calcular cuotas recomendadas
-        FACTOR_SEGURIDAD = 0.8
-        recommended_quotas = np.round(
-            reception_flow + (availability_matrix * FACTOR_SEGURIDAD)
+        # Obtener métricas
+        metrics_result = await db.execute(
+            select(CamilaMetrica).where(CamilaMetrica.run_id == run.id)
         )
+        metrics = metrics_result.scalar_one_or_none()
         
-        # Procesar datos reales
-        real_data = None
-        if real_data_db:
-            real_movements = np.zeros((9, 8))
-            for real in real_data_db:
-                try:
-                    b_idx = get_block_index(real.bloque)
-                    t_idx = real.tiempo - 1
-                    if 0 <= b_idx < 9 and 0 <= t_idx < 8:
-                        real_movements[b_idx][t_idx] = real.movimientos
-                except Exception as e:
-                    logger.warning(f"Error procesando dato real: {e}")
-            
-            real_data = {"data": real_movements.tolist()}
+        if not metrics:
+            raise HTTPException(404, "No se encontraron métricas para esta configuración")
         
-        # Calcular comparación
-        comparison = None
-        if real_data:
-            real_totals = np.sum(real_movements, axis=1)
-            real_std = np.std(real_totals)
-            
-            workload_balance_improvement = 0
-            if real_std > 0:
-                workload_balance_improvement = ((real_std - std_dev_blocks) / real_std) * 100
-            
-            real_max = np.max(real_totals)
-            congestion_reduction = 0
-            if real_max > 0:
-                congestion_reduction = ((real_max - max_flow) / real_max) * 100
-            
-            total_capacity = np.sum(capacity_matrix)
-            resource_utilization = 0
-            if total_capacity > 0:
-                resource_utilization = (total_movements / total_capacity) * 100
-            
-            comparison = {
-                "workload_balance_improvement": float(workload_balance_improvement),
-                "congestion_reduction": float(congestion_reduction),
-                "resource_utilization": float(resource_utilization),
-                "total_movements_diff": int(total_movements - np.sum(real_movements))
-            }
+        # Obtener variables para el resumen
+        variables = await _get_variables_summary(db, run.id)
         
-        # Logs para debugging
-        logger.info(f"block_participation: {block_participation}")
-        logger.info(f"time_participation: {time_participation}")
-        logger.info(f"total_movements: {total_movements}")
+        # Obtener parámetros
+        params = await _get_parameters(db, run.id)
         
-        # Retornar respuesta con TODOS los campos necesarios
-        return {
-            "run_id": str(run.id),
-            "config": {
-                "semana": run.semana,
-                "dia": run.dia,
-                "turno": run.turno,
-                "modelo_tipo": run.modelo_tipo,
-                "con_segregaciones": run.con_segregaciones,
-                "disponible": True
-            },
-            "grue_assignment": {"data": grue_assignment},
-            "reception_flow": {"data": reception_flow.tolist()},
-            "delivery_flow": {"data": delivery_flow.tolist()},
-            "loading_flow": {"data": loading_flow.tolist()},
-            "unloading_flow": {"data": unloading_flow.tolist()},
-            "total_flows": {"data": total_flows_matrix.tolist()},
-            "capacity": {"data": capacity_matrix.tolist()},
-            "availability": {"data": availability_matrix.tolist()},
-            "recommended_quotas": {"data": recommended_quotas.tolist()},
-            "block_participation": block_participation,
-            "time_participation": time_participation,
-            "std_dev_blocks": std_dev_blocks,
-            "std_dev_time": std_dev_time,
-            "workload_balance": workload_balance,
-            "congestion_index": congestion_index,
-            "objective_value": getattr(run, 'objective_value', 0),
-            "real_data": real_data,
-            "comparison": comparison
-        }
+        # Construir métricas por bloque
+        metricas_bloques = []
+        for bloque, data in metrics.metricas_bloque.items():
+            metricas_bloques.append(MetricasBloque(
+                bloque=bloque,
+                movimientos_total=int(data.get('movimientos_total', 0)),
+                recepcion=int(data.get('recepcion', 0)),
+                entrega=int(data.get('entrega', 0)),
+                gruas_asignadas=int(data.get('gruas_asignadas', 0)),
+                periodos_activos=len(data.get('periodos_activos', [])),
+                participacion=0,  # Se calcula después
+                utilizacion=0  # Se calcula después
+            ))
+        
+        # Calcular participación
+        total_mov = run.total_movimientos or 1
+        for mb in metricas_bloques:
+            mb.participacion = (mb.movimientos_total / total_mov * 100) if total_mov > 0 else 0
+        
+        # Construir métricas por grúa
+        metricas_gruas = []
+        for grua, data in metrics.metricas_grua.items():
+            metricas_gruas.append(MetricasGrua(
+                grua=grua,
+                periodos_activos=data.get('periodos_activos', 0),
+                bloques_asignados=list(data.get('bloques', [])),
+                movimientos_teoricos=data.get('periodos_activos', 0) * params.get('mu', 30),
+                utilizacion=(data.get('periodos_activos', 0) / 8 * 100),
+                asignaciones=data.get('asignaciones', [])
+            ))
+        
+        # Construir métricas por tiempo
+        metricas_tiempo = []
+        for t in range(1, 9):
+            tiempo_str = str(t)
+            total_t = sum(metrics.matriz_flujos_total[b][t-1] for b in range(9))
+            participacion_t = (total_t / total_mov * 100) if total_mov > 0 else 0
+            
+            # Calcular hora real según turno
+            base_hour = (turno - 1) * 8
+            hora_real = f"{(base_hour + t - 1):02d}:00"
+            
+            metricas_tiempo.append(MetricasTiempo(
+                tiempo=t,
+                hora_real=hora_real,
+                movimientos_total=int(total_t),
+                gruas_activas=0,  # TODO: calcular desde matriz
+                bloques_activos=sum(1 for b in range(9) if metrics.matriz_flujos_total[b][t-1] > 0),
+                participacion=participacion_t
+            ))
+        
+        # Construir métricas por segregación
+        segregaciones = await _get_segregaciones_info(db, run.id)
+        metricas_segregaciones = []
+        
+        for seg_code, data in metrics.metricas_segregacion.items():
+            seg_info = next((s for s in segregaciones if s['codigo'] == seg_code), None)
+            
+            metricas_segregaciones.append(MetricasSegregacion(
+                segregacion=seg_code,
+                descripcion=seg_info['descripcion'] if seg_info else '',
+                tipo=seg_info['tipo'] if seg_info else 'desconocido',
+                movimientos_recepcion=int(data.get('recepcion', 0)),
+                movimientos_entrega=int(data.get('entrega', 0)),
+                bloques=list(data.get('bloques', []))
+            ))
+        
+        # Construir respuesta
+        return CamilaResults(
+            run_id=run.id,
+            config=CamilaConfigInput(
+                semana=run.semana,
+                dia=run.dia,
+                turno=run.turno,
+                modelo_tipo=run.modelo_tipo,
+                con_segregaciones=run.con_segregaciones
+            ),
+            funcion_objetivo=run.funcion_objetivo,
+            total_movimientos=run.total_movimientos,
+            balance_workload=run.balance_workload,
+            indice_congestion=run.indice_congestion,
+            utilizacion_sistema=metrics.utilizacion_promedio,
+            variables_summary=variables,
+            metricas_bloques=metricas_bloques,
+            metricas_gruas=metricas_gruas,
+            metricas_tiempo=metricas_tiempo,
+            metricas_segregaciones=metricas_segregaciones,
+            matriz_flujos=metrics.matriz_flujos_total,
+            matriz_gruas=metrics.matriz_asignacion_gruas,
+            matriz_capacidad=metrics.matriz_capacidad,
+            matriz_disponibilidad=metrics.matriz_disponibilidad,
+            participacion_bloques=metrics.participacion_bloques,
+            participacion_tiempo=metrics.participacion_tiempo,
+            parametros=params
+        )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error en get_camila_metrics: {str(e)}")
+        logger.error(f"Error obteniendo resultados: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
         raise HTTPException(500, f"Error interno: {str(e)}")
 
-# NUEVOS ENDPOINTS PARA FILTRADO Y ANÁLISIS DETALLADO
-
-@router.get("/flows/by-segregation")
-async def get_flows_by_segregation(
-    run_id: UUID = Query(...),
-    segregaciones: List[str] = Query(None),
+@router.get("/gruas/{grua_id}/timeline", response_model=GruaTimeline)
+async def get_grua_timeline(
+    grua_id: str,
+    run_id: UUID,
     db: AsyncSession = Depends(get_db)
 ):
-    """Obtener flujos filtrados por segregaciones específicas"""
+    """Obtener timeline detallado de una grúa específica"""
     try:
-        query = select(CamilaFlujos).where(CamilaFlujos.run_id == run_id)
-        
-        if segregaciones:
-            query = query.where(CamilaFlujos.segregacion.in_(segregaciones))
-        
-        result = await db.execute(query)
-        flujos = result.scalars().all()
-        
-        # Agrupar por segregación y tipo
-        segregation_data = {}
-        for flujo in flujos:
-            if flujo.segregacion not in segregation_data:
-                segregation_data[flujo.segregacion] = {
-                    'reception': 0,
-                    'delivery': 0,
-                    'loading': 0,
-                    'unloading': 0,
-                    'total': 0
-                }
-            
-            flow_type = FLOW_TYPES.get(flujo.variable, 'other')
-            if flow_type != 'other':
-                segregation_data[flujo.segregacion][flow_type] += flujo.valor
-                segregation_data[flujo.segregacion]['total'] += flujo.valor
-        
-        return segregation_data
-        
-    except Exception as e:
-        logger.error(f"Error obteniendo flujos por segregación: {str(e)}")
-        raise HTTPException(500, f"Error interno: {str(e)}")
-
-@router.get("/gruas/timeline")
-async def get_gruas_timeline(
-    run_id: UUID = Query(...),
-    gruas: List[str] = Query(None),
-    start_hour: int = Query(1, ge=1, le=8),
-    end_hour: int = Query(8, ge=1, le=8),
-    db: AsyncSession = Depends(get_db)
-):
-    """Obtener timeline detallado de asignación de grúas"""
-    try:
-        query = select(CamilaGruas).where(
+        # Obtener asignaciones de la grúa
+        query = select(CamilaVariable).where(
             and_(
-                CamilaGruas.run_id == run_id,
-                CamilaGruas.tiempo >= start_hour,
-                CamilaGruas.tiempo <= end_hour,
-                CamilaGruas.valor == 1
+                CamilaVariable.run_id == run_id,
+                CamilaVariable.grua == grua_id,
+                CamilaVariable.variable.in_(['ygbt', 'alpha_gbt']),
+                CamilaVariable.valor > 0
             )
-        )
-        
-        if gruas:
-            query = query.where(CamilaGruas.grua.in_(gruas))
+        ).order_by(CamilaVariable.tiempo)
         
         result = await db.execute(query)
         asignaciones = result.scalars().all()
         
-        # Construir timeline
-        timeline = {}
+        timeline = []
+        bloques_unicos = set()
+        
         for asig in asignaciones:
-            if asig.grua not in timeline:
-                timeline[asig.grua] = []
-            
-            timeline[asig.grua].append({
-                'hora': asig.tiempo,
+            timeline.append({
+                'tiempo': asig.tiempo,
                 'bloque': asig.bloque,
-                'productividad': GRUA_PRODUCTIVITY
+                'tipo': asig.variable
             })
+            bloques_unicos.add(asig.bloque)
         
-        # Calcular estadísticas por grúa
-        stats = {}
-        for grua, assignments in timeline.items():
-            stats[grua] = {
-                'horas_trabajadas': len(assignments),
-                'bloques_unicos': len(set(a['bloque'] for a in assignments)),
-                'utilizacion': (len(assignments) / (end_hour - start_hour + 1)) * 100
-            }
-        
-        return {
-            'timeline': timeline,
-            'stats': stats
-        }
+        return GruaTimeline(
+            grua=grua_id,
+            timeline=timeline,
+            total_periodos=len(timeline),
+            bloques_unicos=len(bloques_unicos),
+            utilizacion=(len(timeline) / 8 * 100)
+        )
         
     except Exception as e:
-        logger.error(f"Error obteniendo timeline de grúas: {str(e)}")
+        logger.error(f"Error obteniendo timeline de grúa: {str(e)}")
         raise HTTPException(500, f"Error interno: {str(e)}")
 
-@router.get("/blocks/congestion")
-async def get_blocks_congestion(
-    run_id: UUID = Query(...),
-    threshold: float = Query(None, ge=0, le=100),
+@router.get("/blocks/{block_id}/detail", response_model=BlockDetail)
+async def get_block_detail(
+    block_id: str,
+    run_id: UUID,
     db: AsyncSession = Depends(get_db)
 ):
-    """Obtener bloques con nivel de congestión específico"""
+    """Obtener detalle de un bloque específico"""
     try:
-        # Obtener flujos totales
-        flujos_query = select(CamilaFlujos).where(CamilaFlujos.run_id == run_id)
-        flujos_result = await db.execute(flujos_query)
-        flujos_data = flujos_result.scalars().all()
+        # Obtener métricas
+        metrics_result = await db.execute(
+            select(CamilaMetrica).where(CamilaMetrica.run_id == run_id)
+        )
+        metrics = metrics_result.scalar_one_or_none()
         
-        # Calcular congestión por bloque
-        block_totals = {}
-        for flujo in flujos_data:
-            if flujo.bloque not in block_totals:
-                block_totals[flujo.bloque] = 0
-            block_totals[flujo.bloque] += flujo.valor
+        if not metrics:
+            raise HTTPException(404, "No se encontraron métricas")
         
-        # Calcular métricas de congestión
-        if block_totals:
-            max_total = max(block_totals.values())
-            avg_total = sum(block_totals.values()) / len(block_totals)
-            
-            congestion_data = []
-            for bloque, total in block_totals.items():
-                congestion_level = (total / max_total * 100) if max_total > 0 else 0
-                
-                if threshold is None or congestion_level >= threshold:
-                    congestion_data.append({
-                        'bloque': bloque,
-                        'total_movimientos': total,
-                        'congestion_level': congestion_level,
-                        'vs_promedio': ((total - avg_total) / avg_total * 100) if avg_total > 0 else 0
-                    })
-            
-            # Ordenar por nivel de congestión
-            congestion_data.sort(key=lambda x: x['congestion_level'], reverse=True)
-            
-            return congestion_data
+        b_idx = int(block_id[1:]) - 1  # b1 -> 0
         
-        return []
+        # Extraer datos del bloque
+        movimientos_por_tiempo = [int(metrics.matriz_flujos_total[b_idx][t]) for t in range(8)]
+        capacidad_por_tiempo = [int(metrics.matriz_capacidad[b_idx][t]) for t in range(8)]
+        disponibilidad_por_tiempo = [int(metrics.matriz_disponibilidad[b_idx][t]) for t in range(8)]
+        
+        # Obtener grúas por tiempo
+        gruas_por_tiempo = []
+        for t in range(8):
+            gruas_en_t = []
+            for g in range(12):
+                if metrics.matriz_asignacion_gruas[g][b_idx * 8 + t] == 1:
+                    gruas_en_t.append(f"g{g+1}")
+            gruas_por_tiempo.append(gruas_en_t)
+        
+        # Obtener segregaciones del bloque
+        segregaciones = []
+        if block_id in metrics.metricas_bloque:
+            # Buscar en variables qué segregaciones tienen flujos en este bloque
+            seg_query = select(CamilaVariable.segregacion).where(
+                and_(
+                    CamilaVariable.run_id == run_id,
+                    CamilaVariable.bloque == block_id,
+                    CamilaVariable.tipo_variable.in_(['flujo_recepcion', 'flujo_entrega']),
+                    CamilaVariable.valor > 0
+                )
+            ).distinct()
+            
+            seg_result = await db.execute(seg_query)
+            segregaciones = [s for s in seg_result.scalars().all() if s]
+        
+        total_movimientos = sum(movimientos_por_tiempo)
+        total_capacidad = sum(capacidad_por_tiempo)
+        utilizacion_promedio = (total_movimientos / total_capacidad * 100) if total_capacidad > 0 else 0
+        
+        return BlockDetail(
+            bloque=block_id,
+            movimientos_por_tiempo=movimientos_por_tiempo,
+            gruas_por_tiempo=gruas_por_tiempo,
+            capacidad_por_tiempo=capacidad_por_tiempo,
+            disponibilidad_por_tiempo=disponibilidad_por_tiempo,
+            segregaciones=segregaciones,
+            total_movimientos=total_movimientos,
+            utilizacion_promedio=utilizacion_promedio
+        )
         
     except Exception as e:
-        logger.error(f"Error obteniendo congestión de bloques: {str(e)}")
+        logger.error(f"Error obteniendo detalle de bloque: {str(e)}")
         raise HTTPException(500, f"Error interno: {str(e)}")
 
-@router.get("/comparison/minmax-vs-maxmin")
+@router.post("/upload", response_model=UploadResponse)
+async def upload_model_files(
+    resultado_file: UploadFile = File(...),
+    instancia_file: UploadFile = File(...),
+    semana: int = Form(...),
+    dia: str = Form(...),
+    turno: int = Form(...),
+    modelo_tipo: str = Form(...),
+    con_segregaciones: bool = Form(True),
+    db: AsyncSession = Depends(get_db)
+):
+    """Cargar archivos del modelo"""
+    
+    # Validar archivos
+    for file in [resultado_file, instancia_file]:
+        if not file.filename.endswith(('.xlsx', '.xls')):
+            raise HTTPException(400, f"El archivo {file.filename} debe ser Excel")
+    
+    try:
+        # Guardar archivos temporalmente
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_res:
+            content = await resultado_file.read()
+            tmp_res.write(content)
+            resultado_path = tmp_res.name
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_inst:
+            content = await instancia_file.read()
+            tmp_inst.write(content)
+            instancia_path = tmp_inst.name
+        
+        # Cargar usando el loader
+        loader = CamilaLoader(db)
+        run_id = await loader.load_model_results(
+            resultado_path,
+            instancia_path,
+            semana,
+            dia,
+            turno,
+            modelo_tipo,
+            con_segregaciones
+        )
+        
+        # Obtener estadísticas del run cargado
+        run = await db.get(CamilaRun, run_id)
+        
+        # Limpiar archivos temporales
+        os.unlink(resultado_path)
+        os.unlink(instancia_path)
+        
+        return UploadResponse(
+            message="Archivos procesados exitosamente",
+            run_id=run_id,
+            config=CamilaConfigInput(
+                semana=semana,
+                dia=dia,
+                turno=turno,
+                modelo_tipo=modelo_tipo,
+                con_segregaciones=con_segregaciones
+            ),
+            stats={
+                "funcion_objetivo": run.funcion_objetivo,
+                "total_movimientos": run.total_movimientos,
+                "balance_workload": run.balance_workload,
+                "indice_congestion": run.indice_congestion
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error cargando archivos: {str(e)}")
+        # Limpiar archivos temporales en caso de error
+        if 'resultado_path' in locals():
+            os.unlink(resultado_path)
+        if 'instancia_path' in locals():
+            os.unlink(instancia_path)
+        raise HTTPException(500, f"Error procesando archivos: {str(e)}")
+
+@router.get("/comparison/models", response_model=ModelComparison)
 async def compare_models(
-    semana: int = Query(..., ge=1, le=52),
+    semana: int = Query(...),
     dia: str = Query(...),
-    turno: int = Query(..., ge=1, le=3),
+    turno: int = Query(...),
     con_segregaciones: bool = Query(True),
     db: AsyncSession = Depends(get_db)
 ):
-    """Comparar resultados MinMax vs MaxMin para la misma configuración"""
+    """Comparar modelos MinMax vs MaxMin"""
     try:
-        service = CamilaService(db)
-        
         # Obtener ambos modelos
         models_data = {}
+        
         for model_type in ['minmax', 'maxmin']:
-            try:
-                # Buscar run
-                query = select(CamilaRun).where(
-                    and_(
-                        CamilaRun.semana == semana,
-                        CamilaRun.dia == dia,
-                        CamilaRun.turno == turno,
-                        CamilaRun.modelo_tipo == model_type,
-                        CamilaRun.con_segregaciones == con_segregaciones
-                    )
+            query = select(CamilaRun).where(
+                and_(
+                    CamilaRun.semana == semana,
+                    CamilaRun.dia == dia,
+                    CamilaRun.turno == turno,
+                    CamilaRun.modelo_tipo == model_type,
+                    CamilaRun.con_segregaciones == con_segregaciones
                 )
+            )
+            
+            result = await db.execute(query)
+            run = result.scalar_one_or_none()
+            
+            if run:
+                # Obtener métricas
+                metrics_result = await db.execute(
+                    select(CamilaMetrica).where(CamilaMetrica.run_id == run.id)
+                )
+                metrics = metrics_result.scalar_one_or_none()
                 
-                result = await db.execute(query)
-                run = result.scalar_one_or_none()
-                
-                if run:
+                if metrics:
                     models_data[model_type] = {
-                        'run_id': str(run.id),
-                        'total_movimientos': run.total_movimientos,
-                        'balance_workload': run.balance_workload,
-                        'indice_congestion': run.indice_congestion
+                        'run': run,
+                        'metrics': metrics
                     }
-            except:
-                pass
         
         if len(models_data) < 2:
             raise HTTPException(404, "No se encontraron ambos modelos para comparar")
         
-        # Calcular diferencias
-        minmax = models_data.get('minmax', {})
-        maxmin = models_data.get('maxmin', {})
+        # Preparar comparación
+        config1 = CamilaConfigInput(
+            semana=semana,
+            dia=dia,
+            turno=turno,
+            modelo_tipo='minmax',
+            con_segregaciones=con_segregaciones
+        )
         
-        comparison = {
-            'minmax': minmax,
-            'maxmin': maxmin,
-            'diferencias': {
-                'total_movimientos': maxmin.get('total_movimientos', 0) - minmax.get('total_movimientos', 0),
-                'balance_workload': maxmin.get('balance_workload', 0) - minmax.get('balance_workload', 0),
-                'indice_congestion': maxmin.get('indice_congestion', 0) - minmax.get('indice_congestion', 0)
+        config2 = CamilaConfigInput(
+            semana=semana,
+            dia=dia,
+            turno=turno,
+            modelo_tipo='maxmin',
+            con_segregaciones=con_segregaciones
+        )
+        
+        # Métricas comparadas
+        metricas_comparadas = {
+            'funcion_objetivo': {
+                'minmax': models_data['minmax']['run'].funcion_objetivo,
+                'maxmin': models_data['maxmin']['run'].funcion_objetivo
             },
-            'recomendacion': 'minmax' if minmax.get('indice_congestion', 0) < maxmin.get('indice_congestion', 0) else 'maxmin'
+            'total_movimientos': {
+                'minmax': models_data['minmax']['run'].total_movimientos,
+                'maxmin': models_data['maxmin']['run'].total_movimientos
+            },
+            'balance_workload': {
+                'minmax': models_data['minmax']['run'].balance_workload,
+                'maxmin': models_data['maxmin']['run'].balance_workload
+            },
+            'indice_congestion': {
+                'minmax': models_data['minmax']['run'].indice_congestion,
+                'maxmin': models_data['maxmin']['run'].indice_congestion
+            },
+            'utilizacion': {
+                'minmax': models_data['minmax']['metrics'].utilizacion_promedio,
+                'maxmin': models_data['maxmin']['metrics'].utilizacion_promedio
+            }
         }
         
-        return comparison
+        # Calcular mejoras (maxmin vs minmax)
+        mejoras = {}
+        for metrica, valores in metricas_comparadas.items():
+            if metrica in ['balance_workload', 'utilizacion']:
+                # Mayor es mejor
+                mejoras[metrica] = valores['maxmin'] - valores['minmax']
+            elif metrica in ['indice_congestion', 'funcion_objetivo']:
+                # Menor es mejor
+                mejoras[metrica] = valores['minmax'] - valores['maxmin']
+            else:
+                mejoras[metrica] = valores['maxmin'] - valores['minmax']
+        
+        # Distribución por bloques
+        distribucion_bloques1 = models_data['minmax']['metrics'].participacion_bloques
+        distribucion_bloques2 = models_data['maxmin']['metrics'].participacion_bloques
+        
+        # Análisis y recomendación
+        analisis = []
+        
+        if mejoras['balance_workload'] > 5:
+            analisis.append("MaxMin mejora significativamente el balance de carga")
+        elif mejoras['balance_workload'] < -5:
+            analisis.append("MinMax proporciona mejor balance de carga")
+        
+        if mejoras['indice_congestion'] > 0.2:
+            analisis.append("MinMax reduce la congestión en bloques críticos")
+        elif mejoras['indice_congestion'] < -0.2:
+            analisis.append("MaxMin genera mayor congestión en algunos bloques")
+        
+        if mejoras['utilizacion'] > 5:
+            analisis.append("MaxMin aprovecha mejor los recursos disponibles")
+        
+        # Recomendación basada en prioridades
+        puntos_minmax = 0
+        puntos_maxmin = 0
+        
+        if mejoras['balance_workload'] > 0:
+            puntos_maxmin += 1
+        else:
+            puntos_minmax += 1
+        
+        if mejoras['indice_congestion'] > 0:
+            puntos_minmax += 2  # Más peso a la congestión
+        else:
+            puntos_maxmin += 2
+        
+        if mejoras['funcion_objetivo'] > 0:
+            puntos_minmax += 1
+        else:
+            puntos_maxmin += 1
+        
+        recomendacion = 'minmax' if puntos_minmax > puntos_maxmin else 'maxmin'
+        
+        if abs(puntos_minmax - puntos_maxmin) <= 1:
+            analisis.append("Ambos modelos tienen desempeño similar, la elección depende de las prioridades operacionales")
+        
+        return ModelComparison(
+            config1=config1,
+            config2=config2,
+            metricas_comparadas=metricas_comparadas,
+            mejoras=mejoras,
+            distribucion_bloques1=distribucion_bloques1,
+            distribucion_bloques2=distribucion_bloques2,
+            recomendacion=recomendacion,
+            analisis=analisis
+        )
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error comparando modelos: {str(e)}")
         raise HTTPException(500, f"Error interno: {str(e)}")
-
-@router.get("/patterns/peak-hours")
-async def get_peak_hour_patterns(
-    semana_min: int = Query(None, ge=1, le=52),
-    semana_max: int = Query(None, ge=1, le=52),
-    db: AsyncSession = Depends(get_db)
-):
-    """Identificar patrones de horas pico a través de múltiples semanas"""
-    try:
-        # Construir query
-        query = select(
-            CamilaFlujos.tiempo,
-            func.sum(CamilaFlujos.valor).label('total_movimientos')
-        ).join(
-            CamilaRun
-        ).group_by(
-            CamilaFlujos.tiempo
-        )
-        
-        # Aplicar filtros de semana
-        if semana_min:
-            query = query.where(CamilaRun.semana >= semana_min)
-        if semana_max:
-            query = query.where(CamilaRun.semana <= semana_max)
-        
-        result = await db.execute(query)
-        hour_data = result.all()
-        
-        # Construir respuesta
-        patterns = []
-        for hora in hour_data:
-            patterns.append({
-                'hora': hora.tiempo,
-                'hora_real': hora.tiempo + 7,  # Ajustar a hora real (turno 1)
-                'total_movimientos': float(hora.total_movimientos),
-                'es_hora_pico': hora.total_movimientos > np.mean([h.total_movimientos for h in hour_data])
-            })
-        
-        # Ordenar por total de movimientos
-        patterns.sort(key=lambda x: x['total_movimientos'], reverse=True)
-        
-        return patterns
-        
-    except Exception as e:
-        logger.error(f"Error obteniendo patrones de horas pico: {str(e)}")
-        raise HTTPException(500, f"Error interno: {str(e)}")
-
-@router.post("/upload")
-async def upload_camila_file(
-    file: UploadFile = File(...),
-    semana: int = Query(..., ge=1, le=52),
-    dia: str = Query(...),
-    turno: int = Query(..., ge=1, le=3),
-    modelo_tipo: str = Query(..., regex="^(minmax|maxmin)$"),
-    con_segregaciones: bool = Query(True),
-    db: AsyncSession = Depends(get_db)
-):
-    """Cargar archivo de resultados"""
-    if not file.filename.endswith(('.xlsx', '.xls')):
-        raise HTTPException(400, "Solo se permiten archivos Excel")
-    
-    try:
-        # Por ahora, simplemente retornar éxito
-        # Aquí deberías implementar la lógica real de carga
-        return {
-            "message": "Archivo procesado exitosamente",
-            "filename": file.filename,
-            "config": {
-                "semana": semana,
-                "dia": dia,
-                "turno": turno,
-                "modelo_tipo": modelo_tipo,
-                "con_segregaciones": con_segregaciones
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error cargando archivo: {str(e)}")
-        raise HTTPException(500, f"Error procesando archivo: {str(e)}")
 
 @router.delete("/runs/{run_id}")
 async def delete_run(
@@ -586,15 +601,11 @@ async def delete_run(
         if not run:
             raise HTTPException(404, "Run no encontrado")
         
-        # Eliminar en cascada
-        await db.execute(delete(CamilaFlujos).where(CamilaFlujos.run_id == run_id))
-        await db.execute(delete(CamilaGruas).where(CamilaGruas.run_id == run_id))
-        await db.execute(delete(CamilaRealData).where(CamilaRealData.run_id == run_id))
-        await db.execute(delete(CamilaRun).where(CamilaRun.id == run_id))
-        
+        # El cascade debería eliminar todo automáticamente
+        await db.delete(run)
         await db.commit()
         
-        return {"message": "Run eliminado exitosamente"}
+        return {"message": "Run eliminado exitosamente", "run_id": str(run_id)}
         
     except HTTPException:
         raise
@@ -603,48 +614,169 @@ async def delete_run(
         logger.error(f"Error eliminando run: {str(e)}")
         raise HTTPException(500, f"Error interno: {str(e)}")
 
-@router.get("/stats/summary")
-async def get_summary_stats(db: AsyncSession = Depends(get_db)):
-    """Obtener estadísticas generales"""
+@router.get("/runs", response_model=CamilaRunsResponse)
+async def get_runs(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    semana_min: Optional[int] = Query(None, ge=1, le=52),
+    semana_max: Optional[int] = Query(None, ge=1, le=52),
+    modelo_tipo: Optional[str] = Query(None),
+    order_by: str = Query("fecha_carga"),
+    order_desc: bool = Query(True),
+    db: AsyncSession = Depends(get_db)
+):
+    """Obtener lista de runs con paginación y filtros"""
     try:
-        # Total de runs
-        total_runs_result = await db.execute(
-            select(func.count(CamilaRun.id))
+        # Query base
+        query = select(CamilaRun)
+        
+        # Aplicar filtros
+        if semana_min:
+            query = query.where(CamilaRun.semana >= semana_min)
+        if semana_max:
+            query = query.where(CamilaRun.semana <= semana_max)
+        if modelo_tipo:
+            query = query.where(CamilaRun.modelo_tipo == modelo_tipo)
+        
+        # Contar total
+        count_query = select(func.count()).select_from(query.subquery())
+        total_result = await db.execute(count_query)
+        total = total_result.scalar() or 0
+        
+        # Ordenar
+        order_column = getattr(CamilaRun, order_by, CamilaRun.fecha_carga)
+        if order_desc:
+            query = query.order_by(order_column.desc())
+        else:
+            query = query.order_by(order_column)
+        
+        # Paginar
+        query = query.offset(skip).limit(limit)
+        
+        # Ejecutar
+        result = await db.execute(query)
+        runs = result.scalars().all()
+        
+        # Convertir a schema
+        items = [
+            CamilaRunSummary(
+                id=run.id,
+                semana=run.semana,
+                dia=run.dia,
+                turno=run.turno,
+                modelo_tipo=run.modelo_tipo,
+                con_segregaciones=run.con_segregaciones,
+                fecha_carga=run.fecha_carga,
+                funcion_objetivo=run.funcion_objetivo,
+                total_movimientos=run.total_movimientos,
+                balance_workload=run.balance_workload,
+                indice_congestion=run.indice_congestion,
+                gruas_activas=0,  # TODO: obtener de métricas
+                bloques_activos=0  # TODO: obtener de métricas
+            )
+            for run in runs
+        ]
+        
+        # Calcular páginas
+        pages = (total + limit - 1) // limit
+        page = (skip // limit) + 1
+        
+        return CamilaRunsResponse(
+            total=total,
+            items=items,
+            page=page,
+            pages=pages
         )
-        total_runs = total_runs_result.scalar() or 0
         
-        # Promedio de balance workload
-        avg_balance_result = await db.execute(
-            select(func.avg(CamilaRun.balance_workload))
-        )
-        avg_balance = avg_balance_result.scalar() or 0
-        
-        # Runs por modelo
-        model_stats = await db.execute(
-            select(
-                CamilaRun.modelo_tipo,
-                func.count(CamilaRun.id).label('count'),
-                func.avg(CamilaRun.balance_workload).label('avg_balance'),
-                func.avg(CamilaRun.indice_congestion).label('avg_congestion')
-            ).group_by(CamilaRun.modelo_tipo)
-        )
-        
-        model_data = []
-        for row in model_stats:
-            model_data.append({
-                'modelo': row.modelo_tipo,
-                'runs': row.count,
-                'avg_balance': float(row.avg_balance or 0),
-                'avg_congestion': float(row.avg_congestion or 0)
-            })
-        
-        return {
-            "global": {
-                "total_runs": total_runs,
-                "avg_balance": float(avg_balance)
-            },
-            "por_modelo": model_data
-        }
     except Exception as e:
-        logger.error(f"Error obteniendo estadísticas: {str(e)}")
-        raise HTTPException(500, "Error al obtener estadísticas")
+        logger.error(f"Error obteniendo runs: {str(e)}")
+        raise HTTPException(500, f"Error interno: {str(e)}")
+
+# ===================== Funciones auxiliares =====================
+
+async def _get_variables_summary(db: AsyncSession, run_id: UUID) -> VariablesSummary:
+    """Obtener resumen de variables"""
+    
+    # Obtener todas las variables
+    query = select(CamilaVariable).where(CamilaVariable.run_id == run_id)
+    result = await db.execute(query)
+    variables = result.scalars().all()
+    
+    # Clasificar por tipo
+    flujos_recepcion = []
+    flujos_entrega = []
+    asignacion_gruas = []
+    alpha_variables = []
+    z_variables = []
+    funcion_objetivo = 0
+    
+    for var in variables:
+        var_info = VariableInfo(
+            variable=var.variable,
+            indice=var.indice,
+            valor=var.valor,
+            segregacion=var.segregacion,
+            grua=var.grua,
+            bloque=var.bloque,
+            tiempo=var.tiempo,
+            tipo_variable=var.tipo_variable
+        )
+        
+        if var.tipo_variable == 'flujo_recepcion':
+            flujos_recepcion.append(var_info)
+        elif var.tipo_variable == 'flujo_entrega':
+            flujos_entrega.append(var_info)
+        elif var.variable == 'ygbt':
+            asignacion_gruas.append(var_info)
+        elif var.variable == 'alpha_gbt':
+            alpha_variables.append(var_info)
+        elif var.variable == 'Z_gb':
+            z_variables.append(var_info)
+        elif var.variable == 'min_diff_val':
+            funcion_objetivo = var.valor
+    
+    return VariablesSummary(
+        flujos_recepcion=flujos_recepcion,
+        flujos_entrega=flujos_entrega,
+        asignacion_gruas=asignacion_gruas,
+        alpha_variables=alpha_variables,
+        z_variables=z_variables,
+        funcion_objetivo=funcion_objetivo,
+        total_variables=len(variables)
+    )
+
+async def _get_parameters(db: AsyncSession, run_id: UUID) -> Dict[str, Any]:
+    """Obtener parámetros del modelo"""
+    
+    query = select(CamilaParametro).where(CamilaParametro.run_id == run_id)
+    result = await db.execute(query)
+    parametros = result.scalars().all()
+    
+    params_dict = {}
+    for param in parametros:
+        if param.indices:
+            # Parámetro indexado
+            if param.parametro not in params_dict:
+                params_dict[param.parametro] = {}
+            params_dict[param.parametro][str(param.indices)] = param.valor
+        else:
+            # Parámetro simple
+            params_dict[param.parametro] = param.valor
+    
+    return params_dict
+
+async def _get_segregaciones_info(db: AsyncSession, run_id: UUID) -> List[Dict[str, Any]]:
+    """Obtener información de segregaciones"""
+    
+    query = select(CamilaSegregacion).where(CamilaSegregacion.run_id == run_id)
+    result = await db.execute(query)
+    segregaciones = result.scalars().all()
+    
+    return [
+        {
+            'codigo': seg.codigo,
+            'descripcion': seg.descripcion,
+            'tipo': seg.tipo
+        }
+        for seg in segregaciones
+    ]

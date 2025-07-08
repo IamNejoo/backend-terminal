@@ -143,7 +143,6 @@ def aggregate_inventory_stats(movements_data: List[HistoricalMovement], unit: st
         'percentil_90': round(percentil_90, 2),
         'percentil_95': round(percentil_95, 2)
     }
-
 @router.get("/kpis/comprehensive")
 async def get_comprehensive_kpis(
     start_date: str = Query(..., description="Fecha inicio (YYYY-MM-DD)"),
@@ -196,18 +195,26 @@ async def get_comprehensive_kpis(
     result = await db.execute(query)
     movements_data = result.scalars().all()
     
-    # 2. OBTENER DATOS DE TTT
+    # 2. OBTENER DATOS DE TTT - MODIFICADO
     ttt_query = select(
         func.avg(TruckTurnaroundTime.ttt).label('promedio'),
         func.count(TruckTurnaroundTime.id).label('total'),
         func.min(TruckTurnaroundTime.ttt).label('minimo'),
-        func.max(TruckTurnaroundTime.ttt).label('maximo')
+        func.max(TruckTurnaroundTime.ttt).label('maximo'),
+        func.stddev(TruckTurnaroundTime.ttt).label('desviacion')
     ).where(
         and_(
-            TruckTurnaroundTime.pregate_ss >= start_dt,
-            TruckTurnaroundTime.pregate_ss <= end_dt,
-            TruckTurnaroundTime.ttt > 0,  # Excluir valores negativos
-            TruckTurnaroundTime.ttt < 1440  # Excluir valores mayores a 24 horas
+            # Usar múltiples campos de fecha para mayor cobertura
+            or_(
+                and_(TruckTurnaroundTime.pregate_ss >= start_dt, 
+                     TruckTurnaroundTime.pregate_ss <= end_dt),
+                and_(TruckTurnaroundTime.ingate_ss >= start_dt, 
+                     TruckTurnaroundTime.ingate_ss <= end_dt),
+                and_(TruckTurnaroundTime.outgate_se >= start_dt, 
+                     TruckTurnaroundTime.outgate_se <= end_dt)
+            ),
+            TruckTurnaroundTime.ttt > 0,  # Excluir valores negativos o nulos
+            TruckTurnaroundTime.ttt < 1440  # Excluir valores mayores a 24 horas (1440 minutos)
         )
     )
     
@@ -217,8 +224,14 @@ async def get_comprehensive_kpis(
     # Para obtener percentiles de TTT
     ttt_values_query = select(TruckTurnaroundTime.ttt).where(
         and_(
-            TruckTurnaroundTime.pregate_ss >= start_dt,
-            TruckTurnaroundTime.pregate_ss <= end_dt,
+            or_(
+                and_(TruckTurnaroundTime.pregate_ss >= start_dt, 
+                     TruckTurnaroundTime.pregate_ss <= end_dt),
+                and_(TruckTurnaroundTime.ingate_ss >= start_dt, 
+                     TruckTurnaroundTime.ingate_ss <= end_dt),
+                and_(TruckTurnaroundTime.outgate_se >= start_dt, 
+                     TruckTurnaroundTime.outgate_se <= end_dt)
+            ),
             TruckTurnaroundTime.ttt > 0,
             TruckTurnaroundTime.ttt < 1440
         )
@@ -233,33 +246,90 @@ async def get_comprehensive_kpis(
     ttt_values_result = await db.execute(ttt_values_query)
     ttt_values = [row[0] for row in ttt_values_result if row[0] is not None]
     
-    # 3. OBTENER DATOS DE CDT
+    # 3. OBTENER DATOS DE CDT - MODIFICADO SIGNIFICATIVAMENTE
+    # Primero, intentar con el campo cdt_hours si existe
     cdt_query = select(
-        func.avg(ContainerDwellTime.cdt_hours).label('promedio_horas'),
+        func.avg(
+            case(
+                # Si existe cdt_hours, usarlo
+                (ContainerDwellTime.cdt_hours.isnot(None), ContainerDwellTime.cdt_hours),
+                # Si no, calcular la diferencia entre salida y entrada
+                else_=func.extract('epoch', ContainerDwellTime.iufv_ot - ContainerDwellTime.iufv_it) / 3600
+            )
+        ).label('promedio_horas'),
         func.count(ContainerDwellTime.id).label('total'),
-        func.min(ContainerDwellTime.cdt_hours).label('minimo'),
-        func.max(ContainerDwellTime.cdt_hours).label('maximo')
+        func.min(
+            case(
+                (ContainerDwellTime.cdt_hours.isnot(None), ContainerDwellTime.cdt_hours),
+                else_=func.extract('epoch', ContainerDwellTime.iufv_ot - ContainerDwellTime.iufv_it) / 3600
+            )
+        ).label('minimo'),
+        func.max(
+            case(
+                (ContainerDwellTime.cdt_hours.isnot(None), ContainerDwellTime.cdt_hours),
+                else_=func.extract('epoch', ContainerDwellTime.iufv_ot - ContainerDwellTime.iufv_it) / 3600
+            )
+        ).label('maximo'),
+        func.stddev(
+            case(
+                (ContainerDwellTime.cdt_hours.isnot(None), ContainerDwellTime.cdt_hours),
+                else_=func.extract('epoch', ContainerDwellTime.iufv_ot - ContainerDwellTime.iufv_it) / 3600
+            )
+        ).label('desviacion')
     ).where(
         and_(
-            ContainerDwellTime.iufv_it >= start_dt,
-            ContainerDwellTime.iufv_it <= end_dt,
-            ContainerDwellTime.cdt_hours.isnot(None),
-            ContainerDwellTime.cdt_hours > 0,  # Excluir valores negativos
-            ContainerDwellTime.cdt_hours < 720  # Excluir valores mayores a 30 días
+            # Filtrar por fechas de entrada o salida en el período
+            or_(
+                and_(ContainerDwellTime.iufv_it >= start_dt, 
+                     ContainerDwellTime.iufv_it <= end_dt),
+                and_(ContainerDwellTime.iufv_ot >= start_dt, 
+                     ContainerDwellTime.iufv_ot <= end_dt)
+            ),
+            # Asegurar que tenemos ambas fechas para calcular
+            ContainerDwellTime.iufv_it.isnot(None),
+            ContainerDwellTime.iufv_ot.isnot(None),
+            # La salida debe ser posterior a la entrada
+            ContainerDwellTime.iufv_ot > ContainerDwellTime.iufv_it,
+            # Excluir valores extremos (más de 30 días = 720 horas)
+            or_(
+                and_(
+                    ContainerDwellTime.cdt_hours.isnot(None),
+                    ContainerDwellTime.cdt_hours > 0,
+                    ContainerDwellTime.cdt_hours < 720
+                ),
+                func.extract('epoch', ContainerDwellTime.iufv_ot - ContainerDwellTime.iufv_it) / 3600 < 720
+            )
         )
     )
     
     if operation_type:
         cdt_query = cdt_query.where(ContainerDwellTime.operation_type == operation_type)
     
-    # Para obtener percentiles de CDT
-    cdt_values_query = select(ContainerDwellTime.cdt_hours).where(
+    # Para obtener percentiles de CDT - también modificado
+    cdt_values_query = select(
+        case(
+            (ContainerDwellTime.cdt_hours.isnot(None), ContainerDwellTime.cdt_hours),
+            else_=func.extract('epoch', ContainerDwellTime.iufv_ot - ContainerDwellTime.iufv_it) / 3600
+        ).label('cdt_calc')
+    ).where(
         and_(
-            ContainerDwellTime.iufv_it >= start_dt,
-            ContainerDwellTime.iufv_it <= end_dt,
-            ContainerDwellTime.cdt_hours.isnot(None),
-            ContainerDwellTime.cdt_hours > 0,
-            ContainerDwellTime.cdt_hours < 720
+            or_(
+                and_(ContainerDwellTime.iufv_it >= start_dt, 
+                     ContainerDwellTime.iufv_it <= end_dt),
+                and_(ContainerDwellTime.iufv_ot >= start_dt, 
+                     ContainerDwellTime.iufv_ot <= end_dt)
+            ),
+            ContainerDwellTime.iufv_it.isnot(None),
+            ContainerDwellTime.iufv_ot.isnot(None),
+            ContainerDwellTime.iufv_ot > ContainerDwellTime.iufv_it,
+            or_(
+                and_(
+                    ContainerDwellTime.cdt_hours.isnot(None),
+                    ContainerDwellTime.cdt_hours > 0,
+                    ContainerDwellTime.cdt_hours < 720
+                ),
+                func.extract('epoch', ContainerDwellTime.iufv_ot - ContainerDwellTime.iufv_it) / 3600 < 720
+            )
         )
     )
     
@@ -270,7 +340,7 @@ async def get_comprehensive_kpis(
     cdt_stats = cdt_result.first()
     
     cdt_values_result = await db.execute(cdt_values_query)
-    cdt_values = [row[0] for row in cdt_values_result if row[0] is not None]
+    cdt_values = [row[0] for row in cdt_values_result if row[0] is not None and row[0] > 0]
     
     # 4. CALCULAR KPIs DE CAPACIDAD Y OCUPACIÓN
     capacidad_filtrada = CAPACIDAD_TOTAL_TERMINAL
@@ -567,6 +637,18 @@ async def get_comprehensive_kpis(
         else:
             kpi_relations['tttCongestionStatus'] = 'normal'
     
+    # Nueva relación: CDT vs Utilización
+    if cdt_stats and cdt_stats.promedio_horas:
+        cdt_dias = cdt_stats.promedio_horas / 24
+        if cdt_dias > 7 and utilizacion_por_volumen > 70:
+            kpi_relations['cdtUtilizacionStatus'] = 'critical'
+        elif cdt_dias > 5 and utilizacion_por_volumen > 60:
+            kpi_relations['cdtUtilizacionStatus'] = 'warning'
+        elif cdt_dias < 3 and utilizacion_por_volumen < 50:
+            kpi_relations['cdtUtilizacionStatus'] = 'good'
+        else:
+            kpi_relations['cdtUtilizacionStatus'] = 'normal'
+    
     # 8. CONSTRUIR RESPUESTA COMPLETA
     result = {
         # KPIs de Capacidad y Ocupación
@@ -621,28 +703,39 @@ async def get_comprehensive_kpis(
             'vistaContexto': 'terminal' if is_terminal_view else ('patio' if is_patio_view else 'bloque')
         },
         
-        # KPIs de Tiempos de Servicio
+        # KPIs de Tiempos de Servicio - MODIFICADO
         'tiemposServicio': {
             'ttt': {
                 'promedio': round(ttt_stats.promedio, 2) if ttt_stats and ttt_stats.promedio else 0,
                 'minimo': round(ttt_stats.minimo, 2) if ttt_stats and ttt_stats.minimo else 0,
                 'maximo': round(ttt_stats.maximo, 2) if ttt_stats and ttt_stats.maximo else 0,
+                'desviacion': round(ttt_stats.desviacion, 2) if ttt_stats and ttt_stats.desviacion else 0,
                 'mediana': round(calculate_percentile(ttt_values, 50), 2) if ttt_values else 0,
+                'p75': round(calculate_percentile(ttt_values, 75), 2) if ttt_values else 0,
                 'p90': round(calculate_percentile(ttt_values, 90), 2) if ttt_values else 0,
                 'p95': round(calculate_percentile(ttt_values, 95), 2) if ttt_values else 0,
                 'totalCamiones': ttt_stats.total if ttt_stats else 0,
-                'camionesEficientes': len([v for v in ttt_values if v < 60]) if ttt_values else 0
+                'camionesEficientes': len([v for v in ttt_values if v < 60]) if ttt_values else 0,
+                'camionesCriticos': len([v for v in ttt_values if v > 180]) if ttt_values else 0,
+                'promedioHoras': round((ttt_stats.promedio / 60), 2) if ttt_stats and ttt_stats.promedio else 0
             },
             'cdt': {
                 'promedioHoras': round(cdt_stats.promedio_horas, 2) if cdt_stats and cdt_stats.promedio_horas else 0,
                 'promedioDias': round(cdt_stats.promedio_horas / 24, 2) if cdt_stats and cdt_stats.promedio_horas else 0,
-                'minimo': round(cdt_stats.minimo / 24, 2) if cdt_stats and cdt_stats.minimo else 0,
-                'maximo': round(cdt_stats.maximo / 24, 2) if cdt_stats and cdt_stats.maximo else 0,
-                'mediana': round(calculate_percentile(cdt_values, 50) / 24, 2) if cdt_values else 0,
-                'p90': round(calculate_percentile(cdt_values, 90) / 24, 2) if cdt_values else 0,
-                'p95': round(calculate_percentile(cdt_values, 95) / 24, 2) if cdt_values else 0,
+                'minimoHoras': round(cdt_stats.minimo, 2) if cdt_stats and cdt_stats.minimo else 0,
+                'maximoHoras': round(cdt_stats.maximo, 2) if cdt_stats and cdt_stats.maximo else 0,
+                'minimoDias': round(cdt_stats.minimo / 24, 2) if cdt_stats and cdt_stats.minimo else 0,
+                'maximoDias': round(cdt_stats.maximo / 24, 2) if cdt_stats and cdt_stats.maximo else 0,
+                'desviacionHoras': round(cdt_stats.desviacion, 2) if cdt_stats and cdt_stats.desviacion else 0,
+                'medianaHoras': round(calculate_percentile(cdt_values, 50), 2) if cdt_values else 0,
+                'medianaDias': round(calculate_percentile(cdt_values, 50) / 24, 2) if cdt_values else 0,
+                'p75Dias': round(calculate_percentile(cdt_values, 75) / 24, 2) if cdt_values else 0,
+                'p90Dias': round(calculate_percentile(cdt_values, 90) / 24, 2) if cdt_values else 0,
+                'p95Dias': round(calculate_percentile(cdt_values, 95) / 24, 2) if cdt_values else 0,
                 'totalContenedores': cdt_stats.total if cdt_stats else 0,
-                'criticos': len([c for c in cdt_values if c > 168])  # > 7 días
+                'contenedoresRapidos': len([c for c in cdt_values if c < 48]) if cdt_values else 0,  # < 2 días
+                'contenedoresCriticos': len([c for c in cdt_values if c > 168]) if cdt_values else 0,  # > 7 días
+                'contenedoresExtremos': len([c for c in cdt_values if c > 240]) if cdt_values else 0   # > 10 días
             }
         },
         
@@ -667,7 +760,8 @@ async def get_comprehensive_kpis(
             'calidad': {
                 'completitudMovimientos': round((len(movements_data) / (horas_unicas * 18)) * 100, 2) if horas_unicas > 0 else 0,
                 'registrosTTT': ttt_stats.total if ttt_stats else 0,
-                'registrosCDT': cdt_stats.total if cdt_stats else 0
+                'registrosCDT': cdt_stats.total if cdt_stats else 0,
+                'coberturaHoraria': round((horas_unicas / ((end_dt - start_dt).days * 24)) * 100, 2) if (end_dt - start_dt).days > 0 else 0
             }
         }
     }

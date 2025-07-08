@@ -1,10 +1,11 @@
 # app/schemas/camila.py
 from pydantic import BaseModel, Field, validator
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from datetime import datetime
 from uuid import UUID
 
-# Schemas de entrada
+# ===================== Schemas de entrada =====================
+
 class CamilaConfigInput(BaseModel):
     semana: int = Field(..., ge=1, le=52, description="Número de semana")
     dia: str = Field(..., description="Día de la semana en inglés")
@@ -21,10 +22,77 @@ class CamilaConfigInput(BaseModel):
 
 class CamilaFileUpload(BaseModel):
     config: CamilaConfigInput
-    filename: str
+    resultado_filename: str
+    instancia_filename: str
 
-# Schemas de salida
+# ===================== Schemas de variables =====================
+
+class VariableInfo(BaseModel):
+    """Información de una variable del modelo"""
+    variable: str
+    indice: Optional[str]
+    valor: float
+    # Campos parseados
+    segregacion: Optional[str]
+    grua: Optional[str]
+    bloque: Optional[str]
+    tiempo: Optional[int]
+    tipo_variable: str
+
+class VariablesSummary(BaseModel):
+    """Resumen de variables por tipo"""
+    flujos_recepcion: List[VariableInfo]
+    flujos_entrega: List[VariableInfo]
+    asignacion_gruas: List[VariableInfo]
+    alpha_variables: List[VariableInfo]
+    z_variables: List[VariableInfo]
+    funcion_objetivo: float
+    total_variables: int
+
+# ===================== Schemas de métricas =====================
+
+class MetricasBloque(BaseModel):
+    """Métricas por bloque"""
+    bloque: str
+    movimientos_total: int
+    recepcion: int
+    entrega: int
+    gruas_asignadas: int
+    periodos_activos: int
+    participacion: float
+    utilizacion: float
+
+class MetricasGrua(BaseModel):
+    """Métricas por grúa"""
+    grua: str
+    periodos_activos: int
+    bloques_asignados: List[str]
+    movimientos_teoricos: int
+    utilizacion: float
+    asignaciones: List[Dict[str, Any]]  # [{tiempo: 1, bloque: "b3"}, ...]
+
+class MetricasTiempo(BaseModel):
+    """Métricas por período de tiempo"""
+    tiempo: int
+    hora_real: str  # "08:00", "09:00", etc
+    movimientos_total: int
+    gruas_activas: int
+    bloques_activos: int
+    participacion: float
+
+class MetricasSegregacion(BaseModel):
+    """Métricas por segregación"""
+    segregacion: str
+    descripcion: str
+    tipo: str  # exportacion/importacion
+    movimientos_recepcion: int
+    movimientos_entrega: int
+    bloques: List[str]
+
+# ===================== Schemas de salida principales =====================
+
 class CamilaRunSummary(BaseModel):
+    """Resumen de un run"""
     id: UUID
     semana: int
     dia: str
@@ -32,127 +100,88 @@ class CamilaRunSummary(BaseModel):
     modelo_tipo: str
     con_segregaciones: bool
     fecha_carga: datetime
+    funcion_objetivo: float
     total_movimientos: int
     balance_workload: float
     indice_congestion: float
+    gruas_activas: int
+    bloques_activos: int
     
     class Config:
         orm_mode = True
 
-class CamilaConfiguration(BaseModel):
-    semana: int
-    dia: str
-    turno: int
-    modelo_tipo: str
-    con_segregaciones: bool
-    disponible: bool = True
-
-class FlowMatrix(BaseModel):
-    """Matriz de flujos [bloques][tiempos]"""
-    data: List[List[float]]
-    total: float
+class CamilaResults(BaseModel):
+    """Resultados completos del modelo"""
+    # Identificación
+    run_id: UUID
+    config: CamilaConfigInput
     
-    @validator('data')
-    def validate_matrix_size(cls, v):
-        if len(v) != 9:  # 9 bloques
-            raise ValueError("La matriz debe tener 9 filas (bloques)")
-        for row in v:
-            if len(row) != 8:  # 8 períodos
-                raise ValueError("Cada fila debe tener 8 columnas (períodos)")
-        return v
-
-class GrueAssignment(BaseModel):
-    """Asignación de grúas [gruas][bloques*tiempos]"""
-    data: List[List[int]]
-    utilization_by_grue: List[float]
-    
-    @validator('data')
-    def validate_assignment(cls, v):
-        if len(v) != 12:  # 12 grúas
-            raise ValueError("Debe haber 12 grúas")
-        for row in v:
-            if len(row) != 72:  # 9 bloques * 8 tiempos
-                raise ValueError("Cada grúa debe tener 72 slots (9 bloques * 8 tiempos)")
-        return v
-
-class CamilaKPIs(BaseModel):
+    # Métricas principales
+    funcion_objetivo: float
     total_movimientos: int
     balance_workload: float
     indice_congestion: float
-    utilizacion_promedio: float
-    desviacion_std_bloques: float
-    desviacion_std_tiempo: float
-    participacion_bloques: List[float]
-    participacion_tiempo: List[float]
+    utilizacion_sistema: float
+    
+    # Resumen de variables
+    variables_summary: VariablesSummary
+    
+    # Métricas agregadas
+    metricas_bloques: List[MetricasBloque]
+    metricas_gruas: List[MetricasGrua]
+    metricas_tiempo: List[MetricasTiempo]
+    metricas_segregaciones: List[MetricasSegregacion]
+    
+    # Matrices para visualización
+    matriz_flujos: List[List[float]]  # [9 bloques][8 tiempos]
+    matriz_gruas: List[List[int]]  # [12 gruas][72 slots]
+    matriz_capacidad: List[List[float]]  # [9 bloques][8 tiempos]
+    matriz_disponibilidad: List[List[float]]  # [9 bloques][8 tiempos]
+    
+    # Distribuciones porcentuales
+    participacion_bloques: List[float]  # 9 elementos
+    participacion_tiempo: List[float]  # 8 elementos
+    
+    # Parámetros del modelo
+    parametros: Dict[str, Any]  # mu, W, K, Rmax, etc
 
-class ComparisonMetrics(BaseModel):
-    workload_balance_improvement: float
-    congestion_reduction: float
-    resource_utilization: float
-    total_movements_diff: int
-
-class CamilaResults(BaseModel):
-    # Identificación
-    run_id: UUID
-    config: CamilaConfiguration
-    
-    # Asignación de grúas
-    grue_assignment: GrueAssignment
-    
-    # Flujos por tipo
-    reception_flow: FlowMatrix
-    delivery_flow: FlowMatrix
-    loading_flow: FlowMatrix
-    unloading_flow: FlowMatrix
-    total_flows: FlowMatrix
-    
-    # Capacidad y disponibilidad
-    capacity: FlowMatrix
-    availability: FlowMatrix
-    
-    # Cuotas recomendadas
-    recommended_quotas: FlowMatrix
-    
-    # KPIs
-    kpis: CamilaKPIs
-    
-    # Datos reales (si están disponibles)
-    real_data: Optional[FlowMatrix] = None
-    
-    # Comparación (si hay datos reales)
-    comparison: Optional[ComparisonMetrics] = None
-
-class GrueDetail(BaseModel):
+class GruaTimeline(BaseModel):
+    """Timeline de una grúa"""
     grua: str
-    tiempo: int
-    bloque_asignado: Optional[str]
-    movimientos_realizados: int
+    timeline: List[Dict[str, Any]]  # [{tiempo: 1, bloque: "b3", tipo: "ygbt"}, ...]
+    total_periodos: int
+    bloques_unicos: int
     utilizacion: float
 
-class BlockHourDetail(BaseModel):
+class BlockDetail(BaseModel):
+    """Detalle de un bloque específico"""
     bloque: str
-    hora: int
-    flujo_total: float
-    capacidad: float
-    disponibilidad: float
-    cuota_recomendada: int
-    gruas_asignadas: List[str]
+    movimientos_por_tiempo: List[int]
+    gruas_por_tiempo: List[List[str]]
+    capacidad_por_tiempo: List[int]
+    disponibilidad_por_tiempo: List[int]
+    segregaciones: List[str]
+    total_movimientos: int
+    utilizacion_promedio: float
 
-class CamilaDetailedView(BaseModel):
-    """Vista detallada para análisis específicos"""
-    run_id: UUID
-    config: CamilaConfiguration
-    
-    # Por grúa
-    gruas_detail: List[GrueDetail]
-    
-    # Por bloque-hora
-    blocks_detail: List[BlockHourDetail]
-    
-    # Estadísticas agregadas
-    stats: Dict[str, Any]
+# ===================== Schemas para comparaciones =====================
 
-# Schemas para filtros y queries
+class ModelComparison(BaseModel):
+    """Comparación entre dos modelos o configuraciones"""
+    config1: CamilaConfigInput
+    config2: CamilaConfigInput
+    
+    metricas_comparadas: Dict[str, Dict[str, float]]  # {"metrica": {"modelo1": valor, "modelo2": valor}}
+    mejoras: Dict[str, float]  # {"balance": 15.2, "congestion": -8.5, ...}
+    
+    distribucion_bloques1: List[float]
+    distribucion_bloques2: List[float]
+    
+    recomendacion: str
+    analisis: List[str]
+
+# ===================== Schemas para filtros y queries =====================
+
 class CamilaFilter(BaseModel):
     semana_min: Optional[int] = Field(None, ge=1, le=52)
     semana_max: Optional[int] = Field(None, ge=1, le=52)
@@ -167,7 +196,8 @@ class PaginationParams(BaseModel):
     order_by: str = Field("fecha_carga", pattern="^(fecha_carga|semana|total_movimientos|balance_workload)$")
     order_desc: bool = True
 
-# Response schemas
+# ===================== Schemas de respuesta =====================
+
 class CamilaRunsResponse(BaseModel):
     total: int
     items: List[CamilaRunSummary]
@@ -176,6 +206,14 @@ class CamilaRunsResponse(BaseModel):
 
 class HealthCheck(BaseModel):
     status: str = "ok"
+    service: str = "camila"
+    version: str = "2.0"
     tables_exist: bool
     total_runs: int
     last_update: Optional[datetime]
+
+class UploadResponse(BaseModel):
+    message: str
+    run_id: UUID
+    config: CamilaConfigInput
+    stats: Dict[str, Any]  # {"variables_loaded": 186, "gruas_activas": 11, ...}

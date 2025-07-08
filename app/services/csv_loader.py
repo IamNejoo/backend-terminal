@@ -2,16 +2,18 @@
 import pandas as pd
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
-from datetime import datetime
+from datetime import datetime, date
 import logging
 import re
-
+from sqlalchemy import select, and_, text
 from app.models.historical_movements import HistoricalMovement
 from app.models.container_dwell_time import ContainerDwellTime
 from app.models.truck_turnaround_time import TruckTurnaroundTime
-
+from app.models.container_position import ContainerPosition
+from pathlib import Path
+import glob
+import numpy as np
 logger = logging.getLogger(__name__)
-
 def clean_numeric_value(value, field_name=None, stats=None):
     """Limpia valores numéricos y cuenta los cambios"""
     if pd.isna(value):
@@ -76,7 +78,225 @@ def clean_float_value(value, field_name=None, stats=None):
 
 class CSVLoaderService:
     def __init__(self, db: AsyncSession):
-        self.db = db  
+        self.db = db
+    async def load_container_positions_csv(self, file_path: str, fecha: date, turno: int, semana_iso: str):
+        """
+        Cargar CSV de posiciones de contenedores - VERSIÓN FINAL FUNCIONANDO
+        """
+        try:
+            filename = Path(file_path).name
+            
+            # Leer CSV
+            df = pd.read_csv(file_path, sep=';', dtype={
+                'gkey': str,
+                'Posicion': str,
+                'category': str,
+                'tiempo': str,
+                'requires_power': str,
+                'nominal_length': str,
+                'hazardous': str
+            })
+            
+            if len(df) == 0:
+                return 0
+            
+            # Filtrar posiciones válidas
+            df = df[df['Posicion'].notna() & (df['Posicion'].str.len() >= 6)].copy()
+            
+            # Procesar datos
+            df['patio'] = df['Posicion'].str[0]
+            df['bloque'] = df['Posicion'].str[1] 
+            df['bahia'] = pd.to_numeric(df['Posicion'].str[2:4], errors='coerce')
+            df['fila'] = df['Posicion'].str[4]
+            df['tier'] = pd.to_numeric(df['Posicion'].str[5], errors='coerce')
+            
+            df = df.dropna(subset=['bahia', 'tier'])
+            df['bahia'] = df['bahia'].astype(int)
+            df['tier'] = df['tier'].astype(int)
+            
+            df['gkey'] = df['gkey'].astype(str).str.strip()
+            df = df[df['gkey'] != '']
+            
+            df['category'] = df['category'].fillna('UNKNOWN').astype(str).str[:10]
+            df['nominal_length'] = df['nominal_length'].astype(str).str.extract('(\d+)').fillna(20).astype(int)
+            df['requires_power'] = df['requires_power'].fillna('0').astype(str).str.strip() == '1'
+            df['hazardous'] = df['hazardous'].fillna('0').astype(str).str.strip() == '1'
+            
+            # Manejar tiempo_permanencia
+            df['tiempo_clean'] = pd.to_numeric(df['tiempo'], errors='coerce')
+            df['tiempo_permanencia'] = df['tiempo_clean'].where(df['tiempo_clean'] > 0, None)
+            
+            # IMPORTANTE: Convertir timestamps a datetime de Python
+            now = datetime.utcnow()
+            
+            df['fecha'] = fecha
+            df['turno'] = turno
+            df['semana_iso'] = semana_iso
+            df['posicion'] = df['Posicion']
+            df['created_at'] = now  # Usar datetime de Python
+            df['updated_at'] = now  # Usar datetime de Python
+            df['is_active'] = True
+            
+            columns = [
+                'fecha', 'turno', 'semana_iso', 'gkey', 'posicion',
+                'patio', 'bloque', 'bahia', 'fila', 'tier',
+                'category', 'tiempo_permanencia', 'requires_power',
+                'nominal_length', 'hazardous', 'created_at', 'updated_at', 'is_active'
+            ]
+            
+            df_final = df[columns]
+            
+            # Convertir a diccionarios y limpiar
+            records = []
+            for _, row in df_final.iterrows():
+                record = {}
+                for col in columns:
+                    val = row[col]
+                    if col == 'tiempo_permanencia':
+                        if pd.isna(val) or val is None or val == 0:
+                            record[col] = None
+                        else:
+                            record[col] = int(val)
+                    elif pd.isna(val):
+                        record[col] = None
+                    else:
+                        record[col] = val
+                records.append(record)
+            
+            if not records:
+                return 0
+            
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+            
+            # Insertar en chunks
+            chunk_size = 1000
+            total_inserted = 0
+            
+            for i in range(0, len(records), chunk_size):
+                chunk = records[i:i+chunk_size]
+                
+                try:
+                    stmt = pg_insert(ContainerPosition).values(chunk)
+                    stmt = stmt.on_conflict_do_nothing(
+                        index_elements=['fecha', 'turno', 'gkey']
+                    )
+                    
+                    result = await self.db.execute(stmt)
+                    await self.db.commit()
+                    total_inserted += result.rowcount
+                    
+                except Exception as e:
+                    await self.db.rollback()
+                    logger.debug(f"Error en chunk: {str(e)[:50]}")
+                    continue
+            
+            if total_inserted > 0:
+                logger.info(f"✅ {filename}: {total_inserted} registros")
+            else:
+                logger.info(f"⚠️ {filename}: 0 registros (ya existen)")
+            
+            return total_inserted
+            
+        except Exception as e:
+            logger.error(f"Error en {Path(file_path).name}: {str(e)}")
+            return 0
+
+    async def load_container_positions_year(self, year: int = 2022):
+        """
+        Cargar todos los archivos de posiciones - VERSIÓN SECUENCIAL OPTIMIZADA
+        """
+        from datetime import datetime
+        
+        base_path = Path(f"/app/data/{year}")
+        if not base_path.exists():
+            logger.error(f"No existe el directorio: {base_path}")
+            return 0
+        
+        start_time = datetime.now()
+        total_processed = 0
+        total_files = 0
+        files_error = 0
+        
+        turno_map = {"08-00": 1, "15-30": 2, "23-00": 3}
+        
+        # Contar archivos totales primero
+        total_expected = sum(len(list(d.glob("*.csv"))) for d in base_path.iterdir() if d.is_dir())
+        logger.info(f"Total de archivos esperados: {total_expected}")
+        
+        # Procesar secuencialmente
+        for semana_num, semana_dir in enumerate(sorted(base_path.iterdir()), 1):
+            if not semana_dir.is_dir():
+                continue
+                
+            semana_iso = semana_dir.name
+            logger.info(f"\n[{semana_num}/52] Procesando semana: {semana_iso}")
+            
+            csv_files = sorted(semana_dir.glob("*.csv"))
+            
+            for csv_file in csv_files:
+                try:
+                    filename = csv_file.stem
+                    parts = filename.split('_')
+                    
+                    if len(parts) != 2:
+                        logger.warning(f"Formato no reconocido: {filename}")
+                        continue
+                    
+                    fecha_str, turno_str = parts
+                    turno = turno_map.get(turno_str)
+                    
+                    if not turno:
+                        logger.warning(f"Turno no válido: {turno_str}")
+                        continue
+                    
+                    # Parsear fecha
+                    fecha = datetime.strptime(fecha_str, "%Y-%m-%d").date()
+                    
+                    # Cargar archivo
+                    processed = await self.load_container_positions_csv(
+                        str(csv_file),
+                        fecha,
+                        turno,
+                        semana_iso
+                    )
+                    
+                    total_processed += processed
+                    total_files += 1
+                    
+                    # Mostrar progreso cada 10 archivos
+                    if total_files % 10 == 0:
+                        elapsed = (datetime.now() - start_time).total_seconds()
+                        rate = total_files / elapsed
+                        eta = (total_expected - total_files) / rate if rate > 0 else 0
+                        
+                        logger.info(
+                            f"Progreso: {total_files}/{total_expected} "
+                            f"({total_files/total_expected*100:.1f}%) - "
+                            f"{total_processed:,} registros - "
+                            f"{rate:.1f} archivos/seg - "
+                            f"ETA: {int(eta//60)}m {int(eta%60)}s"
+                        )
+                    
+                except Exception as e:
+                    logger.error(f"Error procesando {csv_file.name}: {str(e)}")
+                    files_error += 1
+                    continue
+        
+        # Resumen final
+        duration = (datetime.now() - start_time).total_seconds()
+        
+        logger.info("\n=== RESUMEN DE CARGA DE POSICIONES ===")
+        logger.info(f"Año: {year}")
+        logger.info(f"Archivos procesados: {total_files}")
+        logger.info(f"Archivos con error: {files_error}")
+        logger.info(f"Total registros cargados: {total_processed:,}")
+        logger.info(f"Tiempo total: {int(duration//60)}m {int(duration%60)}s")
+        logger.info(f"Velocidad promedio: {total_files/duration:.1f} archivos/seg")
+        logger.info(f"Registros/segundo: {total_processed/duration:.0f}")
+        
+        return total_processed
+
+
     async def load_historical_csv(self, file_path: str):
         """  
         Cargar CSV de movimientos históricos (congestión)

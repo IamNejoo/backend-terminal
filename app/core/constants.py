@@ -1,125 +1,113 @@
 # app/core/constants.py
-"""Constantes y utilidades para el modelo Camila"""
+"""
+Constantes para el sistema Camila
+"""
 
-# Configuración de bloques
-BLOCKS_INTERNAL = ['b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b9']
-BLOCKS_DISPLAY = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']
+# ===================== BLOQUES =====================
+# Bloques del modelo (b1-b9)
+BLOCKS = ['b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b9']
+NUM_BLOCKS = 9
 
-# Configuración de grúas
+# ===================== GRÚAS =====================
+# Lista de grúas (g1-g12)
 GRUAS = ['g1', 'g2', 'g3', 'g4', 'g5', 'g6', 'g7', 'g8', 'g9', 'g10', 'g11', 'g12']
-GRUA_PRODUCTIVITY = 20  # movimientos/hora por grúa
+NUM_GRUAS = 12
 
-# Configuración temporal
-TIME_PERIODS = 8  # horas por turno
+# Productividad de grúa (movimientos/hora)
+# Valor tomado del parámetro 'mu' en el archivo de instancia
+GRUA_PRODUCTIVITY = 30
+
+# ===================== TIEMPO =====================
+# Períodos de tiempo (1-8 para cada turno)
+TIME_PERIODS = 8
+
+# Turnos
 SHIFTS = {
-    1: {'name': 'Mañana', 'hours': '08:00-16:00', 'start': 8},
-    2: {'name': 'Tarde', 'hours': '16:00-24:00', 'start': 16},
-    3: {'name': 'Noche', 'hours': '00:00-08:00', 'start': 0}
+    1: {'name': 'Turno 1', 'hours': '08:00-16:00', 'start_hour': 8},
+    2: {'name': 'Turno 2', 'hours': '16:00-24:00', 'start_hour': 16},
+    3: {'name': 'Turno 3', 'hours': '00:00-08:00', 'start_hour': 0}
 }
 
-# Días de la semana
-DAYS_ES = {
-    'Monday': 'Lunes',
-    'Tuesday': 'Martes',
-    'Wednesday': 'Miércoles',
-    'Thursday': 'Jueves',
-    'Friday': 'Viernes',
-    'Saturday': 'Sábado',
-    'Sunday': 'Domingo'
-}
-
-# Tipos de flujo
+# ===================== TIPOS DE FLUJO =====================
+# Variables de flujo del modelo
 FLOW_TYPES = {
-    'fr_sbt': 'reception',  # Recepción (gate → bloque)
-    'fe_sbt': 'delivery',   # Entrega (bloque → gate)
-    'fc_sbt': 'loading',    # Carga (bloque → barco)
-    'fd_sbt': 'unloading'   # Descarga (barco → bloque)
+    'fr_sbt': 'reception',    # Flujo de recepción
+    'fe_sbt': 'delivery',     # Flujo de entrega
+    'fc_sbt': 'loading',      # Flujo de carga
+    'fd_sbt': 'unloading'     # Flujo de descarga
 }
 
-# Funciones de conversión
-def block_internal_to_display(internal: str) -> str:
-    """Convierte nombre interno a display (b1 → C1)"""
-    try:
-        # Manejar diferentes formatos
-        if internal.upper() in BLOCKS_DISPLAY:
-            return internal.upper()
-        
-        if internal.lower() in BLOCKS_INTERNAL:
-            idx = BLOCKS_INTERNAL.index(internal.lower())
-            return BLOCKS_DISPLAY[idx]
-        
-        # Intentar extraer número
-        import re
-        match = re.search(r'\d+', internal)
-        if match:
-            num = int(match.group())
-            if 1 <= num <= 9:
-                return f'C{num}'
-                
-    except (ValueError, IndexError):
-        pass
-    
-    raise ValueError(f"Bloque interno no válido: {internal}")
-
-def block_display_to_internal(display: str) -> str:
-    """Convierte nombre display a interno (C1 → b1)"""
-    try:
-        if display.lower() in BLOCKS_INTERNAL:
-            return display.lower()
-            
-        if display.upper() in BLOCKS_DISPLAY:
-            idx = BLOCKS_DISPLAY.index(display.upper())
-            return BLOCKS_INTERNAL[idx]
-            
-    except (ValueError, IndexError):
-        pass
-    
-    raise ValueError(f"Bloque display no válido: {display}")
+# ===================== FUNCIONES AUXILIARES =====================
 
 def get_block_index(block: str) -> int:
-    """Obtiene el índice del bloque (0-8)"""
-    # Intentar como interno
-    if block.lower() in BLOCKS_INTERNAL:
-        return BLOCKS_INTERNAL.index(block.lower())
-    
-    # Intentar como display
-    if block.upper() in BLOCKS_DISPLAY:
-        return BLOCKS_DISPLAY.index(block.upper())
-    
-    # Intentar extraer número
-    import re
-    match = re.search(r'\d+', block)
-    if match:
-        num = int(match.group())
-        if 1 <= num <= 9:
-            return num - 1
-            
-    raise ValueError(f"No se puede obtener índice para bloque: {block}")
+    """Convierte código de bloque a índice (0-based)
+    Ej: 'b1' -> 0, 'b2' -> 1, etc.
+    """
+    try:
+        if block.startswith('b') and len(block) > 1:
+            return int(block[1:]) - 1
+        else:
+            raise ValueError(f"Formato de bloque inválido: {block}")
+    except (ValueError, IndexError):
+        raise ValueError(f"Bloque inválido: {block}")
 
 def get_grua_index(grua: str) -> int:
-    """Obtiene el índice de la grúa (0-11)"""
-    if grua.lower() in GRUAS:
-        return GRUAS.index(grua.lower())
-    
-    # Intentar extraer número
-    import re
-    match = re.search(r'\d+', grua)
-    if match:
-        num = int(match.group())
-        if 1 <= num <= 12:
-            return num - 1
-            
-    raise ValueError(f"No se puede obtener índice para grúa: {grua}")
+    """Convierte código de grúa a índice (0-based)
+    Ej: 'g1' -> 0, 'g2' -> 1, etc.
+    """
+    try:
+        if grua.startswith('g') and len(grua) > 1:
+            return int(grua[1:]) - 1
+        else:
+            raise ValueError(f"Formato de grúa inválido: {grua}")
+    except (ValueError, IndexError):
+        raise ValueError(f"Grúa inválida: {grua}")
 
-def validate_time_period(tiempo: int) -> bool:
-    """Valida que el período de tiempo sea válido"""
-    return 1 <= tiempo <= TIME_PERIODS
-
-def get_shift_hours(shift: int) -> tuple:
-    """Obtiene las horas de inicio y fin de un turno"""
-    if shift not in SHIFTS:
-        raise ValueError(f"Turno inválido: {shift}")
+def get_real_hour(periodo: int, turno: int) -> str:
+    """Convierte período y turno a hora real
+    Ej: periodo=1, turno=1 -> '08:00'
+    """
+    if periodo < 1 or periodo > TIME_PERIODS:
+        raise ValueError(f"Período inválido: {periodo}")
     
-    start = SHIFTS[shift]['start']
-    end = start + TIME_PERIODS
-    return start, end
+    if turno not in SHIFTS:
+        raise ValueError(f"Turno inválido: {turno}")
+    
+    start_hour = SHIFTS[turno]['start_hour']
+    real_hour = start_hour + periodo - 1
+    
+    # Ajustar para formato 24 horas
+    if real_hour >= 24:
+        real_hour -= 24
+    
+    return f"{real_hour:02d}:00"
+
+# ===================== LÍMITES Y VALIDACIONES =====================
+
+# Límites del modelo
+MAX_GRUAS_POR_BLOQUE = 2  # W en el modelo
+MIN_PERIODOS_OPERACION = 2  # K en el modelo
+MAX_GRUAS_ACTIVAS = 12     # Rmax en el modelo
+
+# Validaciones
+VALID_DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+VALID_MODEL_TYPES = ['minmax', 'maxmin']
+
+# ===================== COLORES PARA VISUALIZACIÓN =====================
+
+# Colores para estados de utilización
+UTILIZATION_COLORS = {
+    'high': '#ef4444',      # Rojo - Alta utilización (>80%)
+    'medium': '#f59e0b',    # Naranja - Media utilización (50-80%)
+    'low': '#10b981',       # Verde - Baja utilización (<50%)
+    'none': '#6b7280'       # Gris - Sin utilización
+}
+
+# Colores para congestión
+CONGESTION_COLORS = {
+    'critical': '#dc2626',  # Rojo oscuro - Congestión crítica
+    'high': '#f87171',      # Rojo - Alta congestión
+    'medium': '#fbbf24',    # Amarillo - Congestión media
+    'low': '#34d399',       # Verde - Baja congestión
+    'optimal': '#10b981'    # Verde oscuro - Óptimo
+}

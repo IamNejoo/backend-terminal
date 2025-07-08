@@ -12,6 +12,7 @@ while ! pg_isready -h $POSTGRES_SERVER -p $POSTGRES_PORT -U $POSTGRES_USER; do
 done
 echo "✅ PostgreSQL está listo!"
 
+
 # Ejecutar migraciones/crear tablas - IMPORTAR TODOS LOS MODELOS PRIMERO
 echo "🔨 Creando tablas en la base de datos..."
 python -c "
@@ -28,6 +29,7 @@ try:
     print('  ✓ Historical movements importado')
 except Exception as e:
     print(f'  ✗ Error importando historical_movements: {e}')
+
 try:
     from app.models.sai_flujos import (
         SAIConfiguration, SAIFlujo, SAIVolumenBloque, SAIVolumenSegregacion,
@@ -55,12 +57,20 @@ try:
     print('  ✓ Modelos de Camila importados')
 except Exception as e:
     print(f'  ✗ Error importando camila: {e}')
+
 try:
     from app.models.container_dwell_time import ContainerDwellTime
     from app.models.truck_turnaround_time import TruckTurnaroundTime
     print('  ✓ CDT y TTT importados')
 except Exception as e:
     print(f'  ✗ Error importando CDT/TTT: {e}')
+
+try:
+    from app.models.container_position import ContainerPosition
+    print('  ✓ Container Position importado')
+except Exception as e:
+    print(f'  ✗ Error importando container_position: {e}')
+
 from app.core.config import get_settings
 
 async def create_tables():
@@ -71,23 +81,94 @@ async def create_tables():
     
     # Crear todas las tablas
     async with engine.begin() as conn:
-        # Drop all first if needed (opcional, solo para desarrollo)
-        # await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
+    
+    # Crear índices adicionales
+    print('🔧 Creando índices...')
+    async with engine.connect() as conn:
+        try:
+            # Índices para container_positions
+            await conn.execute(text('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_container_position_unique 
+                ON container_positions (fecha, turno, gkey)
+            '''))
+            
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_container_position_bloque_fecha 
+                ON container_positions (bloque, fecha, turno)
+            '''))
+            
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_container_position_patio_fecha 
+                ON container_positions (patio, fecha, turno)
+            '''))
+            
+            # Índices para camila_runs
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_camila_run_lookup 
+                ON camila_runs (semana, dia, turno, modelo_tipo, con_segregaciones)
+            '''))
+            
+            # Índices para camila_flujos
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_camila_flujos_lookup 
+                ON camila_flujos (run_id, variable, bloque, tiempo)
+            '''))
+            
+            # Índices para camila_gruas
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_camila_gruas_lookup 
+                ON camila_gruas (run_id, grua, tiempo)
+            '''))
+            
+            await conn.commit()
+            print('✅ Índices creados correctamente')
+        except Exception as e:
+            print(f'⚠️ Error creando índices (puede que ya existan): {e}')
     
     # Verificar qué tablas se crearon
     async with engine.connect() as conn:
         result = await conn.execute(
-            text(\"SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename\")
+            text(\"\"\"
+                SELECT tablename 
+                FROM pg_tables 
+                WHERE schemaname = 'public' 
+                ORDER BY tablename
+            \"\"\")
         )
         tables = [row[0] for row in result]
-        print(f'📋 Tablas creadas en la BD: {len(tables)}')
-        for table in tables:
-            print(f'   - {table}')
+        print(f'\\n📋 Tablas creadas en la BD: {len(tables)}')
+        
+        # Agrupar por tipo
+        camila_tables = [t for t in tables if t.startswith('camila_')]
+        magdalena_tables = [t for t in tables if t.startswith('magdalena_')]
+        sai_tables = [t for t in tables if t.startswith('sai_')]
+        other_tables = [t for t in tables if not any(t.startswith(p) for p in ['camila_', 'magdalena_', 'sai_'])]
+        
+        if camila_tables:
+            print('\\n  📊 Tablas de Camila:')
+            for table in camila_tables:
+                print(f'     - {table}')
+        
+        if magdalena_tables:
+            print('\\n  📊 Tablas de Magdalena:')
+            for table in magdalena_tables:
+                print(f'     - {table}')
+        
+        if sai_tables:
+            print('\\n  📊 Tablas de SAI:')
+            for table in sai_tables:
+                print(f'     - {table}')
+        
+        if other_tables:
+            print('\\n  📊 Otras tablas:')
+            for table in other_tables:
+                print(f'     - {table}')
     
     await engine.dispose()
-    print('✅ Proceso de creación de tablas completado!')
+    print('\\n✅ Proceso de creación de tablas completado!')
 
+# Ejecutar la creación de tablas
 asyncio.run(create_tables())
 "
 
@@ -171,6 +252,7 @@ if [ "$SAI_COUNT" -eq "0" ]; then
         if find /app/data/magdalena/2022/instancias_magdalena -name "Flujos_w*.xlsx" -type f | grep -q .; then
             echo "📁 Archivos de SAI encontrados, cargando..."
             python /app/scripts/load_sai_data.py
+            python /app/scripts/load_magdalena_data.py
             echo "✅ Datos de SAI cargados!"
         else
             echo "⚠️  No se encontraron archivos de SAI"
@@ -185,7 +267,34 @@ if [ "$SAI_COUNT" -eq "0" ]; then
 else
     echo "✅ Ya existen $SAI_COUNT configuraciones de SAI"
 fi
+# Verificar Container Positions
+CONTAINER_POS_COUNT=$(python -c "
+import asyncio
+import sys
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from app.models.container_position import ContainerPosition
+from app.core.config import get_settings
 
+async def count_records():
+    settings = get_settings()
+    engine = create_async_engine(settings.DATABASE_URL)
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    
+    try:
+        async with async_session() as db:
+            result = await db.execute(select(func.count(ContainerPosition.id)))
+            count = result.scalar()
+            return count
+    except Exception as e:
+        return 0
+    finally:
+        await engine.dispose()
+
+count = asyncio.run(count_records())
+print(count)
+" 2>/dev/null || echo "0")
 # Verificar CDT
 CDT_COUNT=$(python -c "
 import asyncio
@@ -248,10 +357,10 @@ echo "📊 Estado de datos:"
 echo "   - Movimientos históricos: $HISTORICAL_COUNT registros"
 echo "   - Container Dwell Time: $CDT_COUNT registros"
 echo "   - Truck Turnaround Time: $TTT_COUNT registros"
-
+echo "   - Container Positions: $CONTAINER_POS_COUNT registros"
 # Determinar qué cargar
 LOAD_ALL=false
-if [ "$HISTORICAL_COUNT" -eq "0" ] || [ "$CDT_COUNT" -eq "0" ] || [ "$TTT_COUNT" -eq "0" ]; then
+if [ "$HISTORICAL_COUNT" -eq "0" ] || [ "$CDT_COUNT" -eq "0" ] || [ "$TTT_COUNT" -eq "0" ] || [ "$CONTAINER_POS_COUNT" -eq "0" ]; then
     LOAD_ALL=true
 fi
 
@@ -311,7 +420,38 @@ else
     echo ""
     echo "✅ Todos los tipos de datos ya están cargados"
 fi
+# Verificar si ya hay datos de Container Positions
+echo ""
+echo "🔍 Verificando datos de posiciones de contenedores..."
 
+if [ "$CONTAINER_POS_COUNT" -eq "0" ]; then
+    echo "📊 No hay datos de posiciones, verificando estructura de archivos..."
+    
+    # Verificar si existe la estructura de directorios
+    if [ -d "data/2022" ]; then
+        echo "📁 Estructura de directorios encontrada"
+        
+        # Contar archivos CSV
+        CSV_COUNT=$(find data/2022 -name "*.csv" -type f | wc -l)
+        echo "   - Archivos CSV encontrados: $CSV_COUNT"
+        
+        if [ "$CSV_COUNT" -gt "0" ]; then
+            echo "🚀 Iniciando carga de posiciones de contenedores..."
+            python /app/scripts/load_container_positions.py --year 2022
+            echo "✅ Datos de posiciones cargados!"
+        else
+            echo "⚠️  No se encontraron archivos CSV en data/2022/"
+            echo "    Estructura esperada:"
+            echo "    - data/2022/[semana-iso]/[fecha]_[turno].csv"
+            echo "    - Ejemplo: data/2022/2022-01-03/2022-01-03_08-00.csv"
+        fi
+    else
+        echo "⚠️  No se encontró el directorio data/2022/"
+        echo "    Por favor, verifica que los archivos estén en la estructura correcta"
+    fi
+else
+    echo "✅ Ya existen $CONTAINER_POS_COUNT registros de posiciones"
+fi
 # Verificar si ya hay datos de Magdalena
 echo "🔍 Verificando datos de Magdalena..."
 MAGDALENA_COUNT=$(python -c "
@@ -366,6 +506,7 @@ else
 fi
 
 # Verificar si ya hay datos de Camila
+echo ""
 echo "🔍 Verificando datos de Camila..."
 CAMILA_COUNT=$(python -c "
 import asyncio
@@ -373,20 +514,10 @@ import sys
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-
-try:
-    from app.models.camila import CamilaRun
-    model_imported = True
-except Exception as e:
-    print(f'Error importando modelo: {e}', file=sys.stderr)
-    model_imported = False
-
+from app.models.camila import CamilaRun
 from app.core.config import get_settings
 
 async def count_records():
-    if not model_imported:
-        return 0
-        
     settings = get_settings()
     engine = create_async_engine(settings.DATABASE_URL)
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -408,21 +539,38 @@ print(count)
 
 if [ "$CAMILA_COUNT" -eq "0" ]; then
     echo "📊 No hay datos de Camila, verificando archivos..."
-
-    echo "Contenido de /app/data/camila:"
-    ls -l /app/data/camila 2>/dev/null || echo "No existe /app/data/camila"
-
-    if [ -d "/app/data/camila" ] && [ "$(ls -A /app/data/camila/*.xlsx 2>/dev/null)" ]; then
-        echo "📁 Archivos de Camila encontrados, cargando..."
-    # python /app/scripts/load_camila_data.py
-        echo "✅ Datos de Camila cargados!"
+    
+    # Verificar estructura de directorios
+    if [ -d "/app/data/camila/2022" ]; then
+        echo "📁 Estructura de Camila 2022 encontrada"
+        
+        # Contar archivos
+        RESULTADO_COUNT=$(find /app/data/camila/2022/resultados_camila -name "resultados_*.xlsx" -type f 2>/dev/null | wc -l)
+        INSTANCIA_COUNT=$(find /app/data/camila/2022/instancias_camila -name "Instancia_*.xlsx" -type f 2>/dev/null | wc -l)
+        
+        echo "   - Archivos de resultados encontrados: $RESULTADO_COUNT"
+        echo "   - Archivos de instancias encontrados: $INSTANCIA_COUNT"
+        
+        if [ "$RESULTADO_COUNT" -gt "0" ] && [ "$INSTANCIA_COUNT" -gt "0" ]; then
+            echo "🚀 Iniciando carga masiva de datos de Camila..."
+            python /app/scripts/load_camila_data.py --all
+            echo "✅ Proceso de carga de Camila completado!"
+        else
+            echo "⚠️  No se encontraron suficientes archivos"
+            echo "    Estructura esperada:"
+            echo "    - /app/data/camila/2022/resultados_camila/mu30k/resultados_turno_*/resultados_*.xlsx"
+            echo "    - /app/data/camila/2022/instancias_camila/mu30k/instancias_turno_*/Instancia_*.xlsx"
+        fi
+    elif [ -d "/app/data/camila" ] && [ "$(ls -A /app/data/camila/*.xlsx 2>/dev/null)" ]; then
+        # Formato antiguo - archivos directos
+        echo "📁 Archivos de Camila encontrados (formato antiguo)"
+        echo "⚠️  Nota: Este formato está deprecado. Considera usar la estructura 2022"
+        # python /app/scripts/load_camila_data_old.py  # Si tienes un script para el formato antiguo
     else
-        echo "⚠️  No se encontraron archivos de Camila en /app/data/camila/"
-        echo "    Archivos esperados:"
-        echo "    - /app/data/camila/resultados_Semana_3_min_max_Modelo1.xlsx"
-        echo "    - /app/data/camila/resultados_Semana_3_max_min_Modelo2.xlsx"
-        echo "    - /app/data/camila/resultados_Semana_3_min_max_SS.xlsx"
-        echo "    - /app/data/camila/resultados_Semana_3_max_min_SS.xlsx"
+        echo "⚠️  No se encontraron archivos de Camila"
+        echo "    Verifica que los archivos estén en:"
+        echo "    - /app/data/camila/2022/ (formato nuevo)"
+        echo "    - /app/data/camila/ (formato antiguo)"
     fi
 else
     echo "✅ Ya existen $CAMILA_COUNT configuraciones de Camila"

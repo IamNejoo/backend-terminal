@@ -1,6 +1,6 @@
 # app/api/v1/router.py
 from fastapi import APIRouter
-from app.api.v1.endpoints import historical, magdalena, camila, sai_flujos
+from app.api.v1.endpoints import historical, magdalena, camila, sai_flujos, container_positions
 
 api_router = APIRouter()
 
@@ -27,4 +27,11 @@ api_router.include_router(
     sai_flujos.router,
     prefix="/sai",
     tags=["sai-flujos"]
+)
+
+
+api_router.include_router(
+    container_positions.router,
+    prefix="/container-positions",
+    tags=["container-positions"]
 )
