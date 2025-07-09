@@ -251,7 +251,7 @@ if [ "$SAI_COUNT" -eq "0" ]; then
         # Verificar si hay archivos de flujos
         if find /app/data/magdalena/2022/instancias_magdalena -name "Flujos_w*.xlsx" -type f | grep -q .; then
             echo "📁 Archivos de SAI encontrados, cargando..."
-            python /app/scripts/load_sai_data.py
+            #python /app/scripts/load_sai_data.py
             python /app/scripts/load_magdalena_data.py
             echo "✅ Datos de SAI cargados!"
         else

@@ -1,237 +1,149 @@
-# scripts/load_magdalena_data.py
-import asyncio
 import os
-from pathlib import Path
 import sys
-import traceback
+from pathlib import Path
 from datetime import datetime
+import logging
+import asyncio
 
-# Agregar el directorio raíz al path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core.database import AsyncSessionLocal
-from app.services.magdalena_loader import MagdalenaLoader
+from app.services.magdalena_service import MagdalenaService
 
-def get_week_from_date(date_str):
-    """Obtiene el número de semana ISO desde una fecha YYYY-MM-DD"""
-    date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-    return date_obj.isocalendar()[1]
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-async def load_initial_data():
-    # Rutas absolutas
-    base_path = Path('/app/data/magdalena/2022')
-    resultados_path = base_path / 'resultados_magdalena'
-    instancias_path = base_path / 'instancias_magdalena'
-    
-    print(f"🔍 DEBUG: Rutas configuradas:")
-    print(f"  - Resultados: {resultados_path}")
-    print(f"  - Instancias: {instancias_path}")
-    print(f"  - ¿Existe resultados? {resultados_path.exists()}")
-    print(f"  - ¿Existe instancias? {instancias_path.exists()}")
-    
-    # Contar archivos procesados
-    total_resultados = 0
-    total_instancias = 0
-    total_reales = 0
-    carpetas_procesadas = 0
-    
-    # Obtener todas las fechas únicas de ambos directorios
-    fechas_resultados = set()
-    fechas_instancias = set()
-    
-    if resultados_path.exists():
-        fechas_resultados = {d.name for d in resultados_path.iterdir() if d.is_dir() and d.name != 'resultados_magdalena'}
-    
-    if instancias_path.exists():
-        fechas_instancias = {d.name for d in instancias_path.iterdir() if d.is_dir()}
-    
-    # Combinar todas las fechas únicas
-    todas_fechas = sorted(fechas_resultados | fechas_instancias)
-    
-    print(f"\n📊 RESUMEN DE FECHAS:")
-    print(f"  - Fechas en resultados: {len(fechas_resultados)}")
-    print(f"  - Fechas en instancias: {len(fechas_instancias)}")
-    print(f"  - Total fechas únicas: {len(todas_fechas)}")
-    
-    # Procesar cada fecha
-    for fecha_str in todas_fechas:
-        # Validar formato de fecha
-        try:
-            semana = get_week_from_date(fecha_str)
-        except ValueError:
-            print(f"⚠️ Saltando directorio con formato inválido: {fecha_str}")
-            continue
+def validar_estructura_archivo(archivo_path: Path) -> tuple[bool, str]:
+    """Valida que el archivo tenga las hojas necesarias"""
+    try:
+        import pandas as pd
+        xl = pd.ExcelFile(archivo_path)
         
-        print(f"\n{'='*60}")
-        print(f"📅 Procesando fecha {fecha_str} (Semana {semana})")
-        carpetas_procesadas += 1
+        hojas_requeridas = ['General', 'Flujos', 'Carga máx-min', 'Ocupación Bloques', 'Workload bloques']
+        hojas_existentes = xl.sheet_names
         
-        # Directorios para esta fecha
-        resultado_dir = resultados_path / fecha_str
-        instancia_dir = instancias_path / fecha_str
+        faltantes = [h for h in hojas_requeridas if h not in hojas_existentes]
         
-        # 1. Buscar y procesar archivos de resultado
-        resultado_files = []
-        if resultado_dir.exists():
-            resultado_files = list(resultado_dir.glob('resultado_*.xlsx'))
-            print(f"🔍 Resultados encontrados: {len(resultado_files)}")
-            for f in resultado_files:
-                print(f"  - {f.name}")
-        else:
-            print(f"⚠️ No existe directorio de resultados para {fecha_str}")
+        if faltantes:
+            return False, f"Faltan hojas: {', '.join(faltantes)}"
         
-        # 2. Buscar archivos de instancia y flujos
-        instancia_files = []
-        flujos_files = []
-        if instancia_dir.exists():
-            instancia_files = list(instancia_dir.glob('[iI]nstancia*.xlsx'))
-            flujos_files = list(instancia_dir.glob('*flujos*.xlsx'))
-            print(f"🔍 Instancias encontradas: {len(instancia_files)}")
-            print(f"🔍 Flujos encontrados: {len(flujos_files)}")
-        else:
-            print(f"⚠️ No existe directorio de instancias para {fecha_str}")
+        return True, "OK"
+    except Exception as e:
+        return False, f"Error leyendo archivo: {str(e)}"
+
+async def main():
+    """Carga masiva de archivos de Magdalena"""
+    
+    base_path = Path("/app/optimization_files/resultados_magdalena")
+    
+    if not base_path.exists():
+        logger.error(f"No existe el directorio: {base_path}")
+        return
+    
+    # Estadísticas
+    stats = {
+        'total_archivos': 0,
+        'archivos_validos': 0,
+        'archivos_cargados': 0,
+        'total_registros': 0,
+        'errores': []
+    }
+    
+    # Obtener todas las carpetas de fechas
+    fechas = sorted([d for d in base_path.iterdir() if d.is_dir()])
+    
+    logger.info(f"{'='*60}")
+    logger.info(f"Iniciando carga de {len(fechas)} fechas")
+    logger.info(f"{'='*60}")
+    
+    async with AsyncSessionLocal() as db:
+        service = MagdalenaService(db)
         
-        # Procesar cada archivo de resultado
-        for resultado_file in resultado_files:
-            print(f"\n  🔄 Procesando resultado: {resultado_file.name}")
+        for fecha_dir in fechas:
+            fecha_str = fecha_dir.name
             
-            # Extraer participación y dispersión del nombre
-            parts = resultado_file.stem.split('_')
-            
-            # Buscar participación y dispersión
-            participacion = None
-            con_dispersion = None
-            
-            for i, part in enumerate(parts):
-                if part.isdigit() and len(part) <= 3:
-                    participacion = int(part)
-                    if i + 1 < len(parts) and parts[i + 1] in ['K', 'N']:
-                        con_dispersion = parts[i + 1] == 'K'
-                        break
-            
-            if participacion is None:
-                print(f"  ⚠️ No se pudo extraer participación de: {resultado_file.name}")
+            # Validar formato de fecha
+            try:
+                datetime.strptime(fecha_str, '%Y-%m-%d')
+            except ValueError:
+                logger.warning(f"Saltando directorio con formato inválido: {fecha_str}")
                 continue
             
-            print(f"  📊 Config: Semana={semana}, Participación={participacion}, Dispersión={'K' if con_dispersion else 'N'}")
+            logger.info(f"\n📅 Procesando fecha: {fecha_str}")
             
-            # 1. Cargar resultado
-            try:
-                async with AsyncSessionLocal() as db:
-                    loader = MagdalenaLoader(db)
-                    print(f"  Cargando resultado...")
-                    
-                    await loader.load_resultado_file(
-                        str(resultado_file),
-                        semana,
-                        participacion,
-                        con_dispersion
-                    )
-                    
-                    await db.commit()
-                    print("  ✅ Resultado cargado OK")
-                    total_resultados += 1
-                    
-            except Exception as e:
-                print(f"  ❌ ERROR resultado: {str(e)}")
-                if "DEBUG" in os.environ:
-                    traceback.print_exc()
-
-            # 2. Buscar y cargar instancia correspondiente
-            instancia_encontrada = None
-            patron_dispersion = 'K' if con_dispersion else 'N'
+            # Buscar archivos de resultado
+            archivos = list(fecha_dir.glob("resultado_*.xlsx"))
+            stats['total_archivos'] += len(archivos)
             
-            for inst_file in instancia_files:
-                # Buscar instancia que coincida
-                if f"_{participacion}_{patron_dispersion}" in inst_file.name or f"{participacion}_{patron_dispersion}" in inst_file.name:
-                    instancia_encontrada = inst_file
-                    break
-            
-            if instancia_encontrada:
+            for archivo in archivos:
+                # Validar estructura
+                valido, mensaje = validar_estructura_archivo(archivo)
+                
+                if not valido:
+                    logger.error(f"❌ {archivo.name}: {mensaje}")
+                    stats['errores'].append({
+                        'archivo': archivo.name,
+                        'error': mensaje
+                    })
+                    continue
+                
+                stats['archivos_validos'] += 1
+                
+                # Extraer parámetros del nombre
+                # resultado_2022-01-03_68_K.xlsx
+                parts = archivo.stem.split('_')
+                
                 try:
-                    async with AsyncSessionLocal() as db:
-                        loader = MagdalenaLoader(db)
-                        print(f"  Cargando instancia: {instancia_encontrada.name}")
-                        
-                        await loader.load_instancia_file(
-                            str(instancia_encontrada),
-                            semana,
-                            participacion,
-                            con_dispersion
-                        )
-                        
-                        await db.commit()
-                        print("  ✅ Instancia cargada OK")
-                        total_instancias += 1
+                    participacion = int(parts[-2])
+                    con_dispersion = parts[-1] == 'K'
+                    
+                    logger.info(f"📄 Cargando: {archivo.name} (P{participacion}, {'CON' if con_dispersion else 'SIN'} dispersión)")
+                    
+                    result = await service.cargar_archivo_completo(fecha_str, participacion, con_dispersion)
+                    
+                    if result["status"] == "success":
+                        stats['archivos_cargados'] += 1
+                        stats['total_registros'] += result.get("registros", 0)
+                        logger.info(f"✅ Cargados {result['registros']} registros")
+                    else:
+                        stats['errores'].append({
+                            'archivo': archivo.name,
+                            'error': result.get("message", "Error desconocido")
+                        })
+                        logger.error(f"❌ Error: {result['message']}")
                         
                 except Exception as e:
-                    print(f"  ❌ ERROR instancia: {str(e)}")
-                    if "DEBUG" in os.environ:
-                        traceback.print_exc()
-            else:
-                print(f"  ⚠️ No se encontró instancia para P{participacion}_{patron_dispersion}")
-        
-        # 3. Cargar datos reales (flujos) - una vez por fecha
-        if flujos_files and len(flujos_files) > 0:
-            # Solo cargar si no se ha cargado ya para esta fecha
-            flujos_ya_cargados = False
-            for f in flujos_files:
-                if 'analisis_flujos' in f.name:
-                    try:
-                        async with AsyncSessionLocal() as db:
-                            loader = MagdalenaLoader(db)
-                            print(f"\n  Cargando flujos: {f.name}")
-                            
-                            await loader.load_real_data_file(str(f), semana)
-                            
-                            await db.commit()
-                            print("  ✅ Flujos cargados OK")
-                            total_reales += 1
-                            flujos_ya_cargados = True
-                            break  # Solo cargar un archivo de flujos por fecha
-                            
-                    except Exception as e:
-                        print(f"  ❌ ERROR flujos: {str(e)}")
-                        if "DEBUG" in os.environ:
-                            traceback.print_exc()
-
-    print(f"\n{'='*60}")
-    print(f"✅ CARGA COMPLETA - {datetime.now()}")
-    print(f"{'='*60}")
-    print(f"📊 RESUMEN FINAL:")
-    print(f"   - Carpetas procesadas: {carpetas_procesadas}")
-    print(f"   - Resultados cargados: {total_resultados}")
-    print(f"   - Instancias cargadas: {total_instancias}")
-    print(f"   - Datos reales cargados: {total_reales}")
-    print(f"{'='*60}")
+                    stats['errores'].append({
+                        'archivo': archivo.name,
+                        'error': str(e)
+                    })
+                    logger.error(f"❌ Error procesando {archivo.name}: {e}")
     
-    # Verificación adicional en base de datos
-    try:
-        async with AsyncSessionLocal() as db:
-            # Contar registros en cada tabla
-            from sqlalchemy import text
-            
-            # Verificar tabla de configuraciones
-            result = await db.execute(text("SELECT COUNT(*) FROM magdalena_configuracion"))
-            config_count = result.scalar()
-            
-            # Verificar tabla de resultados
-            result = await db.execute(text("SELECT COUNT(*) FROM magdalena_resultado"))
-            resultado_count = result.scalar()
-            
-            # Verificar tabla de datos reales
-            result = await db.execute(text("SELECT COUNT(*) FROM magdalena_real_data"))
-            real_count = result.scalar()
-            
-            print(f"\n📊 VERIFICACIÓN EN BASE DE DATOS:")
-            print(f"   - Configuraciones: {config_count}")
-            print(f"   - Resultados: {resultado_count}")
-            print(f"   - Datos reales: {real_count}")
-            
-    except Exception as e:
-        print(f"\n⚠️ No se pudo verificar la base de datos: {str(e)}")
+    # Resumen final
+    logger.info(f"\n{'='*60}")
+    logger.info(f"RESUMEN DE CARGA")
+    logger.info(f"{'='*60}")
+    logger.info(f"Total archivos encontrados: {stats['total_archivos']}")
+    logger.info(f"Archivos con estructura válida: {stats['archivos_validos']}")
+    logger.info(f"Archivos cargados exitosamente: {stats['archivos_cargados']}")
+    logger.info(f"Total registros creados: {stats['total_registros']}")
+    logger.info(f"Errores encontrados: {len(stats['errores'])}")
+    
+    if stats['errores']:
+        logger.info(f"\n❌ DETALLE DE ERRORES:")
+        for i, err in enumerate(stats['errores'][:10], 1):
+            logger.info(f"{i}. {err['archivo']}: {err['error']}")
+        
+        # Guardar log completo
+        with open('magdalena_carga_errores.log', 'w') as f:
+            for err in stats['errores']:
+                f.write(f"{err['archivo']}: {err['error']}\n")
+        
+        logger.info(f"\nLog completo guardado en: magdalena_carga_errores.log")
 
 if __name__ == "__main__":
-    print(f"🚀 Iniciando carga de datos - {datetime.now()}")
-    print(f"="*60)
-    asyncio.run(load_initial_data())
+    logger.info(f"🚀 Iniciando carga masiva de Magdalena - {datetime.now()}")
+    asyncio.run(main())
