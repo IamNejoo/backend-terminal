@@ -1,6 +1,6 @@
 # app/api/v1/router.py
 from fastapi import APIRouter
-from app.api.v1.endpoints import historical, magdalena, camila, sai_flujos, container_positions
+from app.api.v1.endpoints import historical, camila, optimization, sai_flujos, container_positions
 
 api_router = APIRouter()
 
@@ -12,9 +12,9 @@ api_router.include_router(
 )
 
 api_router.include_router(
-    magdalena.router,
-    prefix="/magdalena", 
-    tags=["magdalena"]
+    optimization.router,
+    prefix="/optimization",  # Cambiar a optimization
+    tags=["optimization"]    # Cambiar a optimization
 )
 
 api_router.include_router(

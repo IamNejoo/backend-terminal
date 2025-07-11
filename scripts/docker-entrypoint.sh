@@ -40,11 +40,21 @@ except Exception as e:
     print(f'  ✗ Error importando sai_flujos: {e}')
 
 try:
-    from app.models.magdalena import (
-        MagdalenaRun, MagdalenaGeneral, MagdalenaOcupacion,
-        MagdalenaWorkload, MagdalenaBahias, MagdalenaVolumen,
-        MagdalenaInstancia, MagdalenaRealData
-    )
+    from app.models.optimization import (
+            Instancia,
+            Bloque,
+            Segregacion,
+            MovimientoReal,
+            MovimientoModelo,
+            DistanciaReal,
+            ResultadoGeneral,
+            AsignacionBloque,
+            CargaTrabajo,
+            OcupacionBloque,
+            KPIComparativo,
+            MetricaTemporal,
+            LogProcesamiento
+        )
     print('  ✓ Modelos de Magdalena importados')
 except Exception as e:
     print(f'  ✗ Error importando magdalena: {e}')

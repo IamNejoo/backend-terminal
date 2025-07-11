@@ -1,219 +1,437 @@
 # app/schemas/camila.py
 from pydantic import BaseModel, Field, validator
-from typing import List, Optional, Dict, Any, Union
-from datetime import datetime
-from uuid import UUID
+from typing import List, Optional, Dict, Any
+from datetime import datetime, date, time
+from enum import Enum
 
-# ===================== Schemas de entrada =====================
+# Enums
+class EstadoInstancia(str, Enum):
+    pendiente = "pendiente"
+    ejecutando = "ejecutando"
+    completado = "completado"
+    error = "error"
 
-class CamilaConfigInput(BaseModel):
-    semana: int = Field(..., ge=1, le=52, description="Número de semana")
-    dia: str = Field(..., description="Día de la semana en inglés")
-    turno: int = Field(..., ge=1, le=3, description="Número de turno")
-    modelo_tipo: str = Field(..., pattern="^(minmax|maxmin)$", description="Tipo de modelo")
-    con_segregaciones: bool = Field(True, description="Incluir segregaciones")
+class TipoContenedor(str, Enum):
+    veinte = "20"
+    cuarenta = "40"
+
+# Base Schemas
+class BloqueBase(BaseModel):
+    codigo: str
+    nombre: Optional[str] = None
+    grupo_movimiento: int
+    capacidad_teus: int
     
-    @validator('dia')
-    def validate_dia(cls, v):
-        valid_days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-        if v not in valid_days:
-            raise ValueError(f"Día debe ser uno de: {', '.join(valid_days)}")
-        return v
+class SegregacionBase(BaseModel):
+    codigo: str
+    descripcion: Optional[str] = None
+    tipo_contenedor: TipoContenedor
+    categoria: str
 
-class CamilaFileUpload(BaseModel):
-    config: CamilaConfigInput
-    resultado_filename: str
-    instancia_filename: str
+class GruaBase(BaseModel):
+    codigo: str
+    tipo: str = "RTG"
+    productividad_nominal: int = 20
 
-# ===================== Schemas de variables =====================
+# Instance Creation
+class InstanciaCamilaCreate(BaseModel):
+    anio: int = Field(..., ge=2017, le=2030)
+    semana: int = Field(..., ge=1, le=52)
+    fecha: date
+    turno: int = Field(..., ge=1, le=21)
+    participacion: int = Field(..., ge=0, le=100)
+    magdalena_instance_id: Optional[int] = None
+    version_modelo: str = "1.0"
 
-class VariableInfo(BaseModel):
-    """Información de una variable del modelo"""
-    variable: str
-    indice: Optional[str]
-    valor: float
-    # Campos parseados
-    segregacion: Optional[str]
-    grua: Optional[str]
-    bloque: Optional[str]
-    tiempo: Optional[int]
-    tipo_variable: str
-
-class VariablesSummary(BaseModel):
-    """Resumen de variables por tipo"""
-    flujos_recepcion: List[VariableInfo]
-    flujos_entrega: List[VariableInfo]
-    asignacion_gruas: List[VariableInfo]
-    alpha_variables: List[VariableInfo]
-    z_variables: List[VariableInfo]
-    funcion_objetivo: float
-    total_variables: int
-
-# ===================== Schemas de métricas =====================
-
-class MetricasBloque(BaseModel):
-    """Métricas por bloque"""
-    bloque: str
-    movimientos_total: int
-    recepcion: int
-    entrega: int
-    gruas_asignadas: int
-    periodos_activos: int
-    participacion: float
-    utilizacion: float
-
-class MetricasGrua(BaseModel):
-    """Métricas por grúa"""
-    grua: str
-    periodos_activos: int
-    bloques_asignados: List[str]
-    movimientos_teoricos: int
-    utilizacion: float
-    asignaciones: List[Dict[str, Any]]  # [{tiempo: 1, bloque: "b3"}, ...]
-
-class MetricasTiempo(BaseModel):
-    """Métricas por período de tiempo"""
-    tiempo: int
-    hora_real: str  # "08:00", "09:00", etc
-    movimientos_total: int
-    gruas_activas: int
-    bloques_activos: int
-    participacion: float
-
-class MetricasSegregacion(BaseModel):
-    """Métricas por segregación"""
-    segregacion: str
-    descripcion: str
-    tipo: str  # exportacion/importacion
-    movimientos_recepcion: int
-    movimientos_entrega: int
-    bloques: List[str]
-
-# ===================== Schemas de salida principales =====================
-
-class CamilaRunSummary(BaseModel):
-    """Resumen de un run"""
-    id: UUID
+# Response Models
+class InstanciaCamilaResponse(BaseModel):
+    id: int
+    anio: int
     semana: int
-    dia: str
+    fecha: date
     turno: int
-    modelo_tipo: str
-    con_segregaciones: bool
-    fecha_carga: datetime
-    funcion_objetivo: float
-    total_movimientos: int
-    balance_workload: float
-    indice_congestion: float
-    gruas_activas: int
-    bloques_activos: int
+    participacion: int
+    estado: EstadoInstancia
+    fecha_creacion: datetime
+    fecha_ejecucion: Optional[datetime]
+    mensaje_error: Optional[str]
+    magdalena_instance_id: Optional[int]
     
     class Config:
-        orm_mode = True
+        from_attributes = True
 
-class CamilaResults(BaseModel):
-    """Resultados completos del modelo"""
-    # Identificación
-    run_id: UUID
-    config: CamilaConfigInput
-    
-    # Métricas principales
+# Dashboard Models
+class KPIBalance(BaseModel):
     funcion_objetivo: float
-    total_movimientos: int
-    balance_workload: float
-    indice_congestion: float
-    utilizacion_sistema: float
-    
-    # Resumen de variables
-    variables_summary: VariablesSummary
-    
-    # Métricas agregadas
-    metricas_bloques: List[MetricasBloque]
-    metricas_gruas: List[MetricasGrua]
-    metricas_tiempo: List[MetricasTiempo]
-    metricas_segregaciones: List[MetricasSegregacion]
-    
-    # Matrices para visualización
-    matriz_flujos: List[List[float]]  # [9 bloques][8 tiempos]
-    matriz_gruas: List[List[int]]  # [12 gruas][72 slots]
-    matriz_capacidad: List[List[float]]  # [9 bloques][8 tiempos]
-    matriz_disponibilidad: List[List[float]]  # [9 bloques][8 tiempos]
-    
-    # Distribuciones porcentuales
-    participacion_bloques: List[float]  # 9 elementos
-    participacion_tiempo: List[float]  # 8 elementos
-    
-    # Parámetros del modelo
-    parametros: Dict[str, Any]  # mu, W, K, Rmax, etc
+    coeficiente_variacion: float
+    indice_balance: float
+    desviacion_estandar: float
 
-class GruaTimeline(BaseModel):
-    """Timeline de una grúa"""
-    grua: str
-    timeline: List[Dict[str, Any]]  # [{tiempo: 1, bloque: "b3", tipo: "ygbt"}, ...]
-    total_periodos: int
-    bloques_unicos: int
-    utilizacion: float
-
-class BlockDetail(BaseModel):
-    """Detalle de un bloque específico"""
-    bloque: str
-    movimientos_por_tiempo: List[int]
-    gruas_por_tiempo: List[List[str]]
-    capacidad_por_tiempo: List[int]
-    disponibilidad_por_tiempo: List[int]
-    segregaciones: List[str]
-    total_movimientos: int
+class KPIGruas(BaseModel):
     utilizacion_promedio: float
+    gruas_activas_promedio: float
+    productividad_promedio: float
+    cambios_totales: int
+    eficiencia_pct: float
 
-# ===================== Schemas para comparaciones =====================
+class KPIFlujos(BaseModel):
+    movimientos_totales: int
+    cumplimiento_carga: float
+    cumplimiento_descarga: float
+    cumplimiento_recepcion: float
+    cumplimiento_entrega: float
+    distribucion: Dict[str, int]
 
-class ModelComparison(BaseModel):
-    """Comparación entre dos modelos o configuraciones"""
-    config1: CamilaConfigInput
-    config2: CamilaConfigInput
-    
-    metricas_comparadas: Dict[str, Dict[str, float]]  # {"metrica": {"modelo1": valor, "modelo2": valor}}
-    mejoras: Dict[str, float]  # {"balance": 15.2, "congestion": -8.5, ...}
-    
-    distribucion_bloques1: List[float]
-    distribucion_bloques2: List[float]
-    
-    recomendacion: str
-    analisis: List[str]
+class KPICamiones(BaseModel):
+    cuota_total: int
+    cuota_promedio: float
+    cuota_maxima: int
+    cuota_minima: int
+    uniformidad: float
+    tiempo_espera_promedio: int
 
-# ===================== Schemas para filtros y queries =====================
+class DashboardResponse(BaseModel):
+    instancia: InstanciaCamilaResponse
+    balance: KPIBalance
+    gruas: KPIGruas
+    flujos: KPIFlujos
+    camiones: KPICamiones
+    congestion_maxima: float
+    bloque_mas_congestionado: str
+    hora_pico: int
 
-class CamilaFilter(BaseModel):
-    semana_min: Optional[int] = Field(None, ge=1, le=52)
-    semana_max: Optional[int] = Field(None, ge=1, le=52)
-    dia: Optional[str] = None
-    turno: Optional[int] = Field(None, ge=1, le=3)
-    modelo_tipo: Optional[str] = Field(None, pattern="^(minmax|maxmin)$")
-    con_segregaciones: Optional[bool] = None
+# Crane Assignment Models
+class AsignacionGruaHora(BaseModel):
+    grua: str
+    bloque: str
+    hora: int
+    productividad: Optional[int]
+    movimientos: Optional[int]
 
-class PaginationParams(BaseModel):
-    skip: int = Field(0, ge=0)
-    limit: int = Field(10, ge=1, le=100)
-    order_by: str = Field("fecha_carga", pattern="^(fecha_carga|semana|total_movimientos|balance_workload)$")
-    order_desc: bool = True
+class ResumenAsignacion(BaseModel):
+    gruas_por_hora: Dict[int, int]
+    cambios_por_grua: Dict[str, int]
+    total_cambios: int
 
-# ===================== Schemas de respuesta =====================
+class AsignacionGruaResponse(BaseModel):
+    instancia_id: int
+    asignaciones: List[AsignacionGruaHora]
+    resumen: ResumenAsignacion
 
-class CamilaRunsResponse(BaseModel):
+# Flow Models
+class FlujoHora(BaseModel):
+    hora: int
+    carga: int
+    descarga: int
+    recepcion: int
+    entrega: int
     total: int
-    items: List[CamilaRunSummary]
+
+class FlujoBloque(BaseModel):
+    bloque: str
+    carga: int
+    descarga: int
+    recepcion: int
+    entrega: int
+    total: int
+
+class FlujosResponse(BaseModel):
+    instancia_id: int
+    por_hora: List[FlujoHora]
+    por_bloque: List[FlujoBloque]
+    totales: Dict[str, int]
+
+# Truck Quota Models
+class CuotaHora(BaseModel):
+    hora: int
+    hora_inicio: time
+    hora_fin: time
+    cuota_recepcion: int
+    cuota_entrega: int
+    cuota_total: int
+    capacidad_disponible: int
+    utilizacion_esperada: float
+
+class CuotasResponse(BaseModel):
+    instancia_id: int
+    cuotas: List[CuotaHora]
+    total_turno: int
+    promedio_hora: float
+    uniformidad: float
+
+# Balance Models
+class BalanceBloque(BaseModel):
+    bloque: str
+    movimientos_totales: int
+    utilizacion_promedio: float
+    congestion_maxima: float
+    gruas_asignadas: int
+    capacidad_total: int
+
+class BalanceResponse(BaseModel):
+    instancia_id: int
+    bloques: List[BalanceBloque]
+    coeficiente_variacion: float
+    balance_score: float
+
+# Timeline Models
+class EventoTimeline(BaseModel):
+    hora: int
+    tipo: str
+    descripcion: str
+    valor: Optional[float]
+    bloque: Optional[str] = None
+
+class TimelineResponse(BaseModel):
+    instancia_id: int
+    eventos: List[EventoTimeline]
+
+# File Upload Models
+class UploadResponse(BaseModel):
+    success: bool
+    message: str
+    instance_id: Optional[int] = None
+    errors: List[str] = []
+
+# Integration Models
+class MagdalenaImportRequest(BaseModel):
+    magdalena_instance_id: int
+    anio: int
+    semana: int
+    turno: int = Field(..., ge=1, le=21)
+    participacion: int
+
+class MagdalenaImportResponse(BaseModel):
+    success: bool
+    instance_id: Optional[int]
+    inventario_importado: Dict[str, int]
+    demanda_importada: Dict[str, int]
+    capacidad_importada: Dict[str, int]
+    mensaje: str
+
+# Validation Models
+class ValidacionCoherencia(BaseModel):
+    es_coherente: bool
+    mensaje: str
+    detalles: Dict[str, Any]
+
+# Stats Models
+class EstadisticasGenerales(BaseModel):
+    total_instancias: int
+    instancias_completadas: int
+    instancias_error: int
+    promedio_funcion_objetivo: float
+    promedio_utilizacion_gruas: float
+    promedio_cumplimiento: float
+
+# List Response
+class InstanciaListResponse(BaseModel):
+    items: List[InstanciaCamilaResponse]
+    total: int
     page: int
+    size: int
     pages: int
 
-class HealthCheck(BaseModel):
-    status: str = "ok"
-    service: str = "camila"
-    version: str = "2.0"
-    tables_exist: bool
-    total_runs: int
-    last_update: Optional[datetime]
+# Detailed Metrics
+class MetricasDetalladas(BaseModel):
+    funcion_objetivo: float
+    gap_optimalidad: Optional[float]
+    tiempo_ejecucion_ms: Optional[int]
+    iteraciones: Optional[int]
+    detalles_balance: Dict[str, float]
+    detalles_gruas: Dict[str, Any]
+    detalles_flujos: Dict[str, Any]
+    detalles_congestion: Dict[str, float]
 
-class UploadResponse(BaseModel):
-    message: str
-    run_id: UUID
-    config: CamilaConfigInput
-    stats: Dict[str, Any]  # {"variables_loaded": 186, "gruas_activas": 11, ...}
+# Error Response
+class ErrorResponse(BaseModel):
+    detail: str
+    errors: Optional[List[Dict[str, Any]]] = None
+
+# Utilidades para validación
+class FileValidation(BaseModel):
+    is_valid: bool
+    file_type: str  # 'instance', 'results', 'magdalena' o 'unknown'
+    missing_sheets: List[str]
+    extra_sheets: List[str]
+    errors: List[str]
+
+# Comparación con Real
+class ComparacionReal(BaseModel):
+    instancia_modelo: int
+    instancia_real: Optional[int]
+    mejora_utilizacion: float
+    mejora_productividad: float
+    reduccion_cambios: float
+    mejora_balance: float
+    detalles: Dict[str, Any]
+
+# Configuración
+class ConfiguracionResponse(BaseModel):
+    id: int
+    clave: str
+    valor: str
+    tipo: str
+    descripcion: Optional[str]
+    activo: bool
+    
+    class Config:
+        from_attributes = True
+
+class ConfiguracionUpdate(BaseModel):
+    valor: str
+    activo: Optional[bool] = True
+
+# Demanda Hora Magdalena
+class DemandaHoraMagdalenaResponse(BaseModel):
+    segregacion: str
+    hora_turno: int
+    dr_recepcion: int
+    dc_carga: int
+    dd_descarga: int
+    de_entrega: int
+    
+    class Config:
+        from_attributes = True
+
+# Grúa Detalle
+class GruaDetalleResponse(BaseModel):
+    codigo: str
+    tipo: str
+    productividad_nominal: int
+    activa: bool
+    en_mantenimiento: bool
+    asignaciones_turno: int
+    productividad_real: Optional[float]
+    eficiencia: Optional[float]
+    
+    class Config:
+        from_attributes = True
+
+# Bloque Detalle
+class BloqueDetalleResponse(BaseModel):
+    codigo: str
+    nombre: Optional[str]
+    grupo_movimiento: int
+    capacidad_teus: int
+    bahias_totales: int
+    ocupacion_actual: Optional[float]
+    gruas_asignadas: Optional[int]
+    movimientos_hora: Optional[int]
+    
+    class Config:
+        from_attributes = True
+
+# Segregación Detalle
+class SegregacionDetalleResponse(BaseModel):
+    codigo: str
+    descripcion: Optional[str]
+    tipo_contenedor: str
+    categoria: str
+    inventario_inicial: Optional[int]
+    movimientos_planificados: Optional[int]
+    bloques_asignados: Optional[List[str]]
+    
+    class Config:
+        from_attributes = True
+
+# Análisis Temporal
+class AnalisisTemporal(BaseModel):
+    instancia_id: int
+    periodo: str  # 'hora', 'turno', 'dia', 'semana'
+    datos: List[Dict[str, Any]]
+    tendencia: str  # 'creciente', 'decreciente', 'estable'
+    proyeccion: Optional[List[Dict[str, Any]]]
+
+# Alerta Operacional
+class AlertaOperacional(BaseModel):
+    tipo: str  # 'congestion', 'desbalance', 'baja_productividad'
+    severidad: str  # 'baja', 'media', 'alta', 'critica'
+    bloque: Optional[str]
+    hora: Optional[int]
+    descripcion: str
+    recomendacion: str
+    valor_actual: float
+    valor_limite: float
+
+class AlertasResponse(BaseModel):
+    instancia_id: int
+    alertas: List[AlertaOperacional]
+    resumen: Dict[str, int]  # Conteo por severidad
+
+# Optimización Sugerida
+class OptimizacionSugerida(BaseModel):
+    tipo: str  # 'reasignacion_grua', 'cambio_cuota', 'redistribucion_flujo'
+    descripcion: str
+    impacto_esperado: str
+    bloques_afectados: List[str]
+    horas_afectadas: List[int]
+    mejora_estimada: float  # Porcentaje
+
+class SugerenciasResponse(BaseModel):
+    instancia_id: int
+    sugerencias: List[OptimizacionSugerida]
+    mejora_total_estimada: float
+
+# Reporte Ejecutivo
+class ReporteEjecutivo(BaseModel):
+    periodo: str
+    fecha_generacion: datetime
+    resumen_operacional: Dict[str, Any]
+    kpis_principales: Dict[str, float]
+    alertas_criticas: List[str]
+    comparacion_periodo_anterior: Optional[Dict[str, float]]
+    recomendaciones: List[str]
+
+# Histórico Comparativo
+class HistoricoComparativo(BaseModel):
+    instancia_actual: int
+    instancias_comparadas: List[int]
+    periodo: str
+    metricas: Dict[str, List[float]]  # metrica -> [valores por instancia]
+    mejora_promedio: Dict[str, float]
+    mejor_instancia: Dict[str, int]  # metrica -> instancia_id
+
+# Validadores personalizados
+class CuotaValidator(BaseModel):
+    cuota_recepcion: int = Field(..., ge=0)
+    cuota_entrega: int = Field(..., ge=0)
+    
+    @validator('cuota_recepcion', 'cuota_entrega')
+    def validar_cuota_positiva(cls, v):
+        if v < 0:
+            raise ValueError('Las cuotas deben ser positivas')
+        return v
+
+class TurnoValidator(BaseModel):
+    turno: int = Field(..., ge=1, le=21)
+    
+    @validator('turno')
+    def validar_turno(cls, v):
+        if not 1 <= v <= 21:
+            raise ValueError('El turno debe estar entre 1 y 21')
+        return v
+
+# Respuesta de procesamiento asíncrono
+class ProcesamientoAsincronoResponse(BaseModel):
+    task_id: str
+    estado: str  # 'pendiente', 'procesando', 'completado', 'error'
+    progreso: Optional[int]  # 0-100
+    mensaje: Optional[str]
+    resultado: Optional[Dict[str, Any]]
+    tiempo_estimado: Optional[int]  # segundos
+
+# Exportación de datos
+class ExportacionRequest(BaseModel):
+    formato: str = Field(..., pattern="^(excel|csv|json)$")
+    incluir_metricas: bool = True
+    incluir_flujos: bool = True
+    incluir_asignaciones: bool = True
+    comprimir: bool = False
+
+class ExportacionResponse(BaseModel):
+    success: bool
+    archivo_url: Optional[str]
+    tamaño_bytes: Optional[int]
+    formato: str
+    fecha_expiracion: Optional[datetime]
