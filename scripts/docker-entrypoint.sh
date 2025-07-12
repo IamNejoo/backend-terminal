@@ -61,8 +61,25 @@ except Exception as e:
 
 try:
     from app.models.camila import (
-        CamilaRun, CamilaFlujos, CamilaGruas, CamilaAsignacion,
-        CamilaResultados, CamilaRealData, CamilaCuotas
+        InstanciaCamila,
+        Bloque,
+        Segregacion,
+        Grua,
+        PeriodoHora,
+        ParametroGeneral,
+        DemandaHoraMagdalena,
+        InventarioInicial,
+        DemandaOperacion,
+        CapacidadBloque,
+        AsignacionGrua,
+        FlujoOperacional,
+        CuotaCamion,
+        DisponibilidadBloque,
+        MetricaResultado,
+        ProductividadGrua,
+        IntegracionMagdalena,
+        ConfiguracionSistema,
+        ConfiguracionInstancia
     )
     print('  ✓ Modelos de Camila importados')
 except Exception as e:
@@ -514,7 +531,6 @@ if [ "$MAGDALENA_COUNT" -eq "0" ]; then
 else
     echo "✅ Ya existen $MAGDALENA_COUNT configuraciones de Magdalena"
 fi
-
 # Verificar si ya hay datos de Camila
 echo ""
 echo "🔍 Verificando datos de Camila..."
@@ -524,7 +540,7 @@ import sys
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-from app.models.camila import CamilaRun
+from app.models.camila import InstanciaCamila  # CAMBIADO de CamilaRun a InstanciaCamila
 from app.core.config import get_settings
 
 async def count_records():
@@ -534,7 +550,7 @@ async def count_records():
     
     try:
         async with async_session() as db:
-            result = await db.execute(select(func.count(CamilaRun.id)))
+            result = await db.execute(select(func.count(InstanciaCamila.id)))  # CAMBIADO
             count = result.scalar()
             return count
     except Exception as e:
@@ -563,7 +579,7 @@ if [ "$CAMILA_COUNT" -eq "0" ]; then
         
         if [ "$RESULTADO_COUNT" -gt "0" ] && [ "$INSTANCIA_COUNT" -gt "0" ]; then
             echo "🚀 Iniciando carga masiva de datos de Camila..."
-            python /app/scripts/load_camila_data.py --all
+            python /app/scripts/load_camila_data_complete.py 
             echo "✅ Proceso de carga de Camila completado!"
         else
             echo "⚠️  No se encontraron suficientes archivos"

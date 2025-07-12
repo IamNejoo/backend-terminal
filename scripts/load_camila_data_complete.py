@@ -11,12 +11,23 @@ import pandas as pd
 # Agregar el directorio raíz al path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.database import AsyncSessionLocal
+from app.core.database import get_db
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from app.core.config import get_settings
 from app.services.camila_service import CamilaService
 from app.services.camila_loader import CamilaLoader
 from app.schemas.camila import InstanciaCamilaCreate
-from app.models.camila import EstadoInstancia
 from sqlalchemy import text
+
+# Crear el AsyncSessionLocal
+settings = get_settings()
+engine = create_async_engine(settings.DATABASE_URL)
+AsyncSessionLocal = sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False
+)
 
 def parse_camila_filename(filename):
     """

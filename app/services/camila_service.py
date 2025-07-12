@@ -19,7 +19,7 @@ from app.models.camila import (
 )
 
 # Importar modelos de Magdalena
-from app.models.magdalena import (
+from app.models.optimization import (
     Instancia as InstanciaMagdalena,
     MovimientoModelo,
     Bloque as BloqueMagdalena,

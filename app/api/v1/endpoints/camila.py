@@ -7,7 +7,7 @@ import os
 import tempfile
 from datetime import datetime, timedelta
 
-from app.database import get_db
+from app.core.database import get_db
 from app.models.camila import InstanciaCamila, EstadoInstancia, MetricaResultado
 from app.schemas.camila import (
     InstanciaCamilaCreate, InstanciaCamilaResponse, DashboardResponse,

@@ -39,9 +39,9 @@ class Instancia(Base):
     metricas_temporales = relationship("MetricaTemporal", back_populates="instancia", cascade="all, delete-orphan")
     
     __table_args__ = (
-        Index('idx_fecha', 'fecha_inicio', 'fecha_fin'),
-        Index('idx_anio_semana', 'anio', 'semana'),
-        Index('idx_participacion', 'participacion', 'con_dispersion'),
+        Index('idx_magdalena_fecha', 'fecha_inicio', 'fecha_fin'),  # CAMBIADO
+        Index('idx_magdalena_anio_semana', 'anio', 'semana'),  # CAMBIADO
+        Index('idx_magdalena_participacion', 'participacion', 'con_dispersion'),  # CAMBIADO
     )
 
 class Bloque(Base):
@@ -93,9 +93,9 @@ class MovimientoReal(Base):
     instancia = relationship("Instancia", back_populates="movimientos_reales")
     
     __table_args__ = (
-        Index('idx_instancia_fecha', 'instancia_id', 'fecha_hora'),
-        Index('idx_tipo_movimiento', 'tipo_movimiento'),
-        Index('idx_bloques', 'bloque_origen', 'bloque_destino'),
+        Index('idx_movreal_instancia_fecha', 'instancia_id', 'fecha_hora'),  # CAMBIADO
+        Index('idx_movreal_tipo_movimiento', 'tipo_movimiento'),  # CAMBIADO
+        Index('idx_movreal_bloques', 'bloque_origen', 'bloque_destino'),  # CAMBIADO
     )
 
 class DistanciaReal(Base):
@@ -109,7 +109,8 @@ class DistanciaReal(Base):
     tipo_destino = Column(String(20))
     
     __table_args__ = (
-        Index('idx_origen_destino', 'origen', 'destino', unique=True),
+        Index('idx_distancia_origen_destino', 'origen', 'destino', unique=True),  # CAMBIADO
+
     )
 
 class ResultadoGeneral(Base):
@@ -167,7 +168,8 @@ class AsignacionBloque(Base):
     bloques_asignados = Column(Integer, default=0)
     
     __table_args__ = (
-        Index('idx_instancia_periodo', 'instancia_id', 'periodo'),
+        Index('idx_asignacion_magdalena_instancia_periodo', 'instancia_id', 'periodo'),  # CAMBIADO
+
     )
 
 class MovimientoModelo(Base):
@@ -190,8 +192,8 @@ class MovimientoModelo(Base):
     bloque = relationship("Bloque")
     
     __table_args__ = (
-        Index('idx_instancia_periodo_modelo', 'instancia_id', 'periodo'),
-        Index('idx_bloque_modelo', 'bloque_id'),
+        Index('idx_movmodelo_instancia_periodo', 'instancia_id', 'periodo'),  # CAMBIADO
+        Index('idx_movmodelo_bloque', 'bloque_id'),  # CAMBIADO
     )
 
 class CargaTrabajo(Base):
@@ -209,8 +211,8 @@ class CargaTrabajo(Base):
     bloque = relationship("Bloque", back_populates="cargas_trabajo")
     
     __table_args__ = (
-        Index('idx_instancia_periodo_carga', 'instancia_id', 'periodo'),
-        Index('idx_bloque_carga', 'bloque_id'),
+        Index('idx_carga_instancia_periodo', 'instancia_id', 'periodo'),  # CAMBIADO
+        Index('idx_carga_bloque', 'bloque_id'),  # CAMBIADO
     )
 
 class OcupacionBloque(Base):
@@ -229,8 +231,8 @@ class OcupacionBloque(Base):
     bloque = relationship("Bloque", back_populates="ocupaciones")
     
     __table_args__ = (
-        Index('idx_instancia_periodo_ocupacion', 'instancia_id', 'periodo'),
-        Index('idx_bloque_ocupacion', 'bloque_id'),
+        Index('idx_ocupacion_instancia_periodo', 'instancia_id', 'periodo'),  # CAMBIADO
+        Index('idx_ocupacion_bloque', 'bloque_id'),  # CAMBIADO
     )
 
 class KPIComparativo(Base):
@@ -249,7 +251,8 @@ class KPIComparativo(Base):
     instancia = relationship("Instancia", back_populates="kpis_comparativos")
     
     __table_args__ = (
-        Index('idx_instancia_categoria', 'instancia_id', 'categoria'),
+        Index('idx_kpi_instancia_categoria', 'instancia_id', 'categoria'),  # CAMBIADO
+
     )
 
 class MetricaTemporal(Base):
@@ -271,8 +274,8 @@ class MetricaTemporal(Base):
     instancia = relationship("Instancia", back_populates="metricas_temporales")
     
     __table_args__ = (
-        Index('idx_instancia_tiempo', 'instancia_id', 'dia', 'turno'),
-        Index('idx_periodo_temporal', 'periodo'),
+        Index('idx_metrica_magdalena_instancia_tiempo', 'instancia_id', 'dia', 'turno'),  # CAMBIADO
+        Index('idx_metrica_magdalena_periodo', 'periodo'),  # CAMBIADO
     )
 
 class LogProcesamiento(Base):
@@ -289,6 +292,6 @@ class LogProcesamiento(Base):
     duracion_segundos = Column(Integer)
     
     __table_args__ = (
-        Index('idx_instancia_log', 'instancia_id'),
-        Index('idx_fecha_log', 'fecha_procesamiento'),
+        Index('idx_log_instancia', 'instancia_id'),  # CAMBIADO
+        Index('idx_log_fecha', 'fecha_procesamiento'),  # CAMBIADO
     )

@@ -1,9 +1,19 @@
 # app/models/camila.py
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Date, Time, ForeignKey, JSON, ARRAY, Text, CheckConstraint, UniqueConstraint, Index
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Date, Time, ForeignKey, JSON, ARRAY, Text, CheckConstraint, UniqueConstraint, Index, Enum
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.models.base import Base
+import enum
 
+
+class EstadoInstancia(enum.Enum):
+    pendiente = "pendiente"
+    ejecutando = "ejecutando"
+    completado = "completado"
+    error = "error"
+    
+    
+    
 class InstanciaCamila(Base):
     __tablename__ = "instancia_camila"
     
@@ -24,7 +34,8 @@ class InstanciaCamila(Base):
     tiempo_ejecucion_ms = Column(Integer)
     
     # Estado
-    estado = Column(String(20), default='pendiente')
+    estado = Column(Enum(EstadoInstancia), default=EstadoInstancia.pendiente)
+
     mensaje_error = Column(Text)
     
     # Metadata
@@ -52,8 +63,8 @@ class InstanciaCamila(Base):
         CheckConstraint('participacion BETWEEN 0 AND 100'),
         CheckConstraint("estado IN ('pendiente', 'ejecutando', 'completado', 'error')"),
         UniqueConstraint('anio', 'semana', 'turno', 'participacion'),
-        Index('idx_instancia_fecha', 'fecha'),
-        Index('idx_instancia_estado', 'estado'),
+       Index('idx_instancia_camila_fecha', 'fecha'),  # CAMBIADO
+        Index('idx_instancia_camila_estado', 'estado'),  # CAMBIADO
         Index('idx_instancia_magdalena', 'magdalena_instance_id'),
     )
 
@@ -112,8 +123,8 @@ class Segregacion(Base):
         CheckConstraint("tipo_contenedor IN ('20', '40')"),
         CheckConstraint("tipo_carga IN ('dry', 'reefer', 'imo', 'oog')"),
         CheckConstraint("categoria IN ('importacion', 'exportacion', 'transbordo')"),
-        Index('idx_segregacion_tipo', 'tipo_contenedor'),
-        Index('idx_segregacion_categoria', 'categoria'),
+        Index('idx_segregacion_camila_tipo', 'tipo_contenedor'),  # CAMBIADO
+        Index('idx_segregacion_camila_categoria', 'categoria'),  # CAMBIADO
     )
 
 class Grua(Base):
@@ -211,7 +222,7 @@ class DemandaHoraMagdalena(Base):
     
     __table_args__ = (
         UniqueConstraint('instancia_id', 'segregacion', 'hora_turno'),
-        Index('idx_demanda_hora_instancia', 'instancia_id'),
+        Index('idx_demanda_hora_camila_instancia', 'instancia_id'),  # CAMBIADO
     )
 
 class InventarioInicial(Base):
@@ -238,7 +249,7 @@ class InventarioInicial(Base):
     
     __table_args__ = (
         UniqueConstraint('instancia_id', 'bloque_id', 'segregacion_id'),
-        Index('idx_inventario_instancia', 'instancia_id'),
+        Index('idx_inventario_camila_instancia', 'instancia_id'),  # CAMBIADO
     )
 
 class DemandaOperacion(Base):
@@ -268,7 +279,7 @@ class DemandaOperacion(Base):
     
     __table_args__ = (
         UniqueConstraint('instancia_id', 'segregacion_id', 'periodo_hora_id'),
-        Index('idx_demanda_periodo', 'periodo_hora_id'),
+        Index('idx_demanda_camila_periodo', 'periodo_hora_id'),  # CAMBIADO
     )
 
 class CapacidadBloque(Base):
@@ -320,9 +331,9 @@ class AsignacionGrua(Base):
     
     __table_args__ = (
         UniqueConstraint('instancia_id', 'grua_id', 'periodo_hora_id'),
-        Index('idx_asignacion_grua', 'grua_id'),
-        Index('idx_asignacion_bloque', 'bloque_id'),
-        Index('idx_asignacion_periodo', 'periodo_hora_id'),
+        Index('idx_asignacion_camila_grua', 'grua_id'),  # CAMBIADO
+        Index('idx_asignacion_camila_bloque', 'bloque_id'),  # CAMBIADO
+        Index('idx_asignacion_camila_periodo', 'periodo_hora_id'),  # CAMBIADO
     )
 
 class FlujoOperacional(Base):
@@ -358,9 +369,9 @@ class FlujoOperacional(Base):
     
     __table_args__ = (
         UniqueConstraint('instancia_id', 'segregacion_id', 'bloque_id', 'periodo_hora_id'),
-        Index('idx_flujo_periodo', 'periodo_hora_id'),
-        Index('idx_flujo_bloque', 'bloque_id'),
-        Index('idx_flujo_instancia_tipo', 'instancia_id', 'bloque_id'),
+        Index('idx_flujo_camila_periodo', 'periodo_hora_id'),  # CAMBIADO
+        Index('idx_flujo_camila_bloque', 'bloque_id'),  # CAMBIADO
+        Index('idx_flujo_camila_instancia_tipo', 'instancia_id', 'bloque_id'),  # CAMBIADO
     )
 
 class CuotaCamion(Base):
@@ -389,7 +400,8 @@ class CuotaCamion(Base):
     
     __table_args__ = (
         UniqueConstraint('instancia_id', 'periodo_hora_id'),
-        Index('idx_cuota_instancia', 'instancia_id', 'cuota_total'),
+        Index('idx_cuota_camila_instancia', 'instancia_id', 'cuota_total'),  # CAMBIADO
+
     )
 
 class DisponibilidadBloque(Base):
@@ -417,7 +429,8 @@ class DisponibilidadBloque(Base):
     
     __table_args__ = (
         UniqueConstraint('instancia_id', 'bloque_id', 'periodo_hora_id'),
-        Index('idx_disponibilidad_congestion', 'instancia_id', 'congestion_index'),
+        Index('idx_disponibilidad_camila_congestion', 'instancia_id', 'congestion_index'),  # CAMBIADO
+
     )
 
 class MetricaResultado(Base):
@@ -466,7 +479,7 @@ class MetricaResultado(Base):
     instancia = relationship("InstanciaCamila", back_populates="metricas")
     
     __table_args__ = (
-        Index('idx_metrica_fecha', 'fecha_calculo'),
+        Index('idx_metrica_camila_fecha', 'fecha_calculo'),  # CAMBIADO
     )
 
 class ProductividadGrua(Base):
@@ -497,7 +510,8 @@ class ProductividadGrua(Base):
     
     __table_args__ = (
         UniqueConstraint('instancia_id', 'grua_id'),
-        Index('idx_productividad_eficiencia', 'instancia_id', 'eficiencia_pct'),
+        Index('idx_productividad_camila_eficiencia', 'instancia_id', 'eficiencia_pct'),  # CAMBIADO
+
     )
 
 class IntegracionMagdalena(Base):
