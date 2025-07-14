@@ -61,25 +61,13 @@ except Exception as e:
 
 try:
     from app.models.camila import (
-        InstanciaCamila,
-        Bloque,
-        Segregacion,
-        Grua,
-        PeriodoHora,
-        ParametroGeneral,
-        DemandaHoraMagdalena,
-        InventarioInicial,
-        DemandaOperacion,
-        CapacidadBloque,
+        ResultadoCamila,
         AsignacionGrua,
-        FlujoOperacional,
         CuotaCamion,
-        DisponibilidadBloque,
-        MetricaResultado,
-        ProductividadGrua,
-        IntegracionMagdalena,
-        ConfiguracionSistema,
-        ConfiguracionInstancia
+        MetricaGrua,
+        ComparacionCamila,
+        ParametroCamila,
+        LogCamila
     )
     print('  ✓ Modelos de Camila importados')
 except Exception as e:
@@ -130,22 +118,22 @@ async def create_tables():
                 ON container_positions (patio, fecha, turno)
             '''))
             
-            # Índices para camila_runs
+            # Índices para resultados_camila
             await conn.execute(text('''
-                CREATE INDEX IF NOT EXISTS idx_camila_run_lookup 
-                ON camila_runs (semana, dia, turno, modelo_tipo, con_segregaciones)
+                CREATE INDEX IF NOT EXISTS idx_resultados_camila_lookup 
+                ON resultados_camila (anio, semana, turno, participacion, con_dispersion)
             '''))
             
-            # Índices para camila_flujos
+            # Índices para asignaciones_gruas
             await conn.execute(text('''
-                CREATE INDEX IF NOT EXISTS idx_camila_flujos_lookup 
-                ON camila_flujos (run_id, variable, bloque, tiempo)
+                CREATE INDEX IF NOT EXISTS idx_asignaciones_gruas_lookup 
+                ON asignaciones_gruas (resultado_id, periodo, bloque_codigo)
             '''))
             
-            # Índices para camila_gruas
+            # Índices para cuotas_camiones
             await conn.execute(text('''
-                CREATE INDEX IF NOT EXISTS idx_camila_gruas_lookup 
-                ON camila_gruas (run_id, grua, tiempo)
+                CREATE INDEX IF NOT EXISTS idx_cuotas_camiones_lookup 
+                ON cuotas_camiones (resultado_id, periodo)
             '''))
             
             await conn.commit()
@@ -167,10 +155,10 @@ async def create_tables():
         print(f'\\n📋 Tablas creadas en la BD: {len(tables)}')
         
         # Agrupar por tipo
-        camila_tables = [t for t in tables if t.startswith('camila_')]
-        magdalena_tables = [t for t in tables if t.startswith('magdalena_')]
+        camila_tables = [t for t in tables if any(t.startswith(p) for p in ['resultados_camila', 'asignaciones_gruas', 'cuotas_camiones', 'metricas_gruas', 'comparaciones_camila', 'parametros_camila', 'logs_camila'])]
+        magdalena_tables = [t for t in tables if t.startswith('magdalena_') or t == 'instancias' or t == 'bloques' or t == 'segregaciones']
         sai_tables = [t for t in tables if t.startswith('sai_')]
-        other_tables = [t for t in tables if not any(t.startswith(p) for p in ['camila_', 'magdalena_', 'sai_'])]
+        other_tables = [t for t in tables if not any(t.startswith(p) for p in ['resultados_camila', 'asignaciones_gruas', 'cuotas_camiones', 'metricas_gruas', 'comparaciones_camila', 'parametros_camila', 'logs_camila', 'magdalena_', 'instancias', 'bloques', 'segregaciones', 'sai_'])]
         
         if camila_tables:
             print('\\n  📊 Tablas de Camila:')
@@ -540,7 +528,7 @@ import sys
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-from app.models.camila import InstanciaCamila  # CAMBIADO de CamilaRun a InstanciaCamila
+from app.models.camila import ResultadoCamila
 from app.core.config import get_settings
 
 async def count_records():
@@ -550,7 +538,7 @@ async def count_records():
     
     try:
         async with async_session() as db:
-            result = await db.execute(select(func.count(InstanciaCamila.id)))  # CAMBIADO
+            result = await db.execute(select(func.count(ResultadoCamila.id)))
             count = result.scalar()
             return count
     except Exception as e:
@@ -567,39 +555,51 @@ if [ "$CAMILA_COUNT" -eq "0" ]; then
     echo "📊 No hay datos de Camila, verificando archivos..."
     
     # Verificar estructura de directorios
-    if [ -d "/app/data/camila/2022" ]; then
-        echo "📁 Estructura de Camila 2022 encontrada"
-        
+    OPTIMIZATION_PATH="${OPTIMIZATION_DATA_PATH:-/app/optimization_data}"
+    
+    # Fallback a ruta local si no existe
+    if [ ! -d "$OPTIMIZATION_PATH" ]; then
+        if [ -d "/home/nejoo/gurobi/resultados_generados" ]; then
+            OPTIMIZATION_PATH="/home/nejoo/gurobi/resultados_generados"
+        fi
+    fi
+    
+    CAMILA_RESULTADOS="$OPTIMIZATION_PATH/resultados_camila"
+    CAMILA_INSTANCIAS="$OPTIMIZATION_PATH/instancias_camila"
+    
+    echo "📁 Buscando datos de Camila en:"
+    echo "   - Resultados: $CAMILA_RESULTADOS"
+    echo "   - Instancias: $CAMILA_INSTANCIAS"
+    
+    if [ -d "$CAMILA_RESULTADOS" ] && [ -d "$CAMILA_INSTANCIAS" ]; then
         # Contar archivos
-        RESULTADO_COUNT=$(find /app/data/camila/2022/resultados_camila -name "resultados_*.xlsx" -type f 2>/dev/null | wc -l)
-        INSTANCIA_COUNT=$(find /app/data/camila/2022/instancias_camila -name "Instancia_*.xlsx" -type f 2>/dev/null | wc -l)
+        RESULTADO_COUNT=$(find "$CAMILA_RESULTADOS" -name "resultado_*_T*.xlsx" -type f 2>/dev/null | wc -l)
+        INSTANCIA_COUNT=$(find "$CAMILA_INSTANCIAS" -name "Instancia_*_T*.xlsx" -type f 2>/dev/null | wc -l)
         
         echo "   - Archivos de resultados encontrados: $RESULTADO_COUNT"
         echo "   - Archivos de instancias encontrados: $INSTANCIA_COUNT"
         
-        if [ "$RESULTADO_COUNT" -gt "0" ] && [ "$INSTANCIA_COUNT" -gt "0" ]; then
+        if [ "$RESULTADO_COUNT" -gt "0" ]; then
             echo "🚀 Iniciando carga masiva de datos de Camila..."
-            python /app/scripts/load_camila_data_complete.py 
+            python /app/scripts/load_camila_data_complete.py
             echo "✅ Proceso de carga de Camila completado!"
         else
-            echo "⚠️  No se encontraron suficientes archivos"
+            echo "⚠️  No se encontraron archivos de resultados"
             echo "    Estructura esperada:"
-            echo "    - /app/data/camila/2022/resultados_camila/mu30k/resultados_turno_*/resultados_*.xlsx"
-            echo "    - /app/data/camila/2022/instancias_camila/mu30k/instancias_turno_*/Instancia_*.xlsx"
+            echo "    - $CAMILA_RESULTADOS/[fecha]/resultado_*_T*.xlsx"
+            echo "    - $CAMILA_INSTANCIAS/[fecha]/Instancia_*_T*.xlsx"
+            echo "    Ejemplo:"
+            echo "    - $CAMILA_RESULTADOS/2022-01-03/resultado_20220103_68_K_T01.xlsx"
+            echo "    - $CAMILA_INSTANCIAS/2022-01-03/Instancia_20220103_68_K_T01.xlsx"
         fi
-    elif [ -d "/app/data/camila" ] && [ "$(ls -A /app/data/camila/*.xlsx 2>/dev/null)" ]; then
-        # Formato antiguo - archivos directos
-        echo "📁 Archivos de Camila encontrados (formato antiguo)"
-        echo "⚠️  Nota: Este formato está deprecado. Considera usar la estructura 2022"
-        # python /app/scripts/load_camila_data_old.py  # Si tienes un script para el formato antiguo
     else
-        echo "⚠️  No se encontraron archivos de Camila"
-        echo "    Verifica que los archivos estén en:"
-        echo "    - /app/data/camila/2022/ (formato nuevo)"
-        echo "    - /app/data/camila/ (formato antiguo)"
+        echo "⚠️  No se encontró la estructura de directorios de Camila"
+        echo "    Verifica que existan los directorios:"
+        echo "    - $CAMILA_RESULTADOS"
+        echo "    - $CAMILA_INSTANCIAS"
     fi
 else
-    echo "✅ Ya existen $CAMILA_COUNT configuraciones de Camila"
+    echo "✅ Ya existen $CAMILA_COUNT resultados de Camila"
 fi
 
 echo "🎯 Iniciando aplicación FastAPI..."

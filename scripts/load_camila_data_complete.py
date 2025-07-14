@@ -1,4 +1,3 @@
-# scripts/load_camila_data_complete.py
 import asyncio
 import os
 from pathlib import Path
@@ -6,365 +5,278 @@ import sys
 import traceback
 from datetime import datetime
 import re
-import pandas as pd
 
 # Agregar el directorio raíz al path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.core.database import get_db
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-from app.core.config import get_settings
-from app.services.camila_service import CamilaService
+from app.core.database import AsyncSessionLocal
 from app.services.camila_loader import CamilaLoader
-from app.schemas.camila import InstanciaCamilaCreate
-from sqlalchemy import text
 
-# Crear el AsyncSessionLocal
-settings = get_settings()
-engine = create_async_engine(settings.DATABASE_URL)
-AsyncSessionLocal = sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False
-)
+def get_week_from_date(date_str):
+    """Obtiene el número de semana ISO desde una fecha YYYY-MM-DD"""
+    date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+    return date_obj.isocalendar()[1]
 
-def parse_camila_filename(filename):
-    """
-    Parsea nombre de archivo de Camila
-    Formato: Instancia_YYYYMMDD_PP_T##.xlsx o Resultado_YYYYMMDD_PP_T##.xlsx
-    """
-    pattern = r'(Instancia|Resultado)_(\d{8})_(\d{2,3})_T(\d{1,2})\.xlsx'
-    match = re.match(pattern, filename)
-    
+def parse_turno_from_filename(filename):
+    """Extrae el número de turno del nombre del archivo"""
+    # Ejemplo: resultado_20220103_68_T01.xlsx -> 1
+    match = re.search(r'_T(\d+)\.xlsx', filename)
     if match:
-        tipo = match.group(1)
-        fecha_str = match.group(2)
-        participacion = int(match.group(3))
-        turno = int(match.group(4))
-        
-        fecha = datetime.strptime(fecha_str, '%Y%m%d')
-        
-        return {
-            'tipo': tipo,
-            'fecha': fecha.date(),
-            'fecha_str': fecha_str,
-            'fecha_magdalena': fecha.strftime('%Y-%m-%d'),
-            'anio': fecha.year,
-            'semana': fecha.isocalendar()[1],
-            'participacion': participacion,
-            'turno': turno
-        }
+        return int(match.group(1))
     return None
 
-def find_matching_files(camila_instance_path, camila_results_path, magdalena_instance_path, info):
-    """
-    Encuentra los 3 archivos necesarios para un turno
-    """
-    files = {
-        'camila_instance': None,
-        'camila_result': None,
-        'magdalena_instance': None
-    }
+async def load_camila_data():
+    """Carga datos de Camila desde la estructura de directorios"""
     
-    # 1. Archivo de instancia Camila
-    pattern = f"Instancia_{info['fecha_str']}_{info['participacion']}_T{info['turno']}.xlsx"
-    file_path = camila_instance_path / pattern
-    if file_path.exists():
-        files['camila_instance'] = file_path
-    else:
-        # Probar con formato T##
-        pattern = f"Instancia_{info['fecha_str']}_{info['participacion']}_T{info['turno']:02d}.xlsx"
-        file_path = camila_instance_path / pattern
-        if file_path.exists():
-            files['camila_instance'] = file_path
+    # Usar variable de entorno específica para datos de optimización
+    optimization_path = os.environ.get('OPTIMIZATION_DATA_PATH', '/app/optimization_data')
+    base_path = Path(optimization_path)
     
-    # 2. Archivo de resultado Camila
-    pattern = f"Resultado_{info['fecha_str']}_{info['participacion']}_T{info['turno']}.xlsx"
-    file_path = camila_results_path / pattern
-    if file_path.exists():
-        files['camila_result'] = file_path
-    else:
-        # Probar con formato T##
-        pattern = f"Resultado_{info['fecha_str']}_{info['participacion']}_T{info['turno']:02d}.xlsx"
-        file_path = camila_results_path / pattern
-        if file_path.exists():
-            files['camila_result'] = file_path
-    
-    # 3. Archivo de instancia Magdalena (puede estar con K o N)
-    for dispersion in ['K', 'N']:
-        pattern = f"Instancia_{info['fecha_magdalena']}_{info['participacion']}_{dispersion}.xlsx"
-        # Buscar en subdirectorio por fecha
-        file_path = magdalena_instance_path / info['fecha_magdalena'] / pattern
-        if file_path.exists():
-            files['magdalena_instance'] = file_path
-            break
-        # Buscar en raíz
-        file_path = magdalena_instance_path / pattern
-        if file_path.exists():
-            files['magdalena_instance'] = file_path
-            break
-    
-    return files
-
-async def process_camila_instance(db, service, loader, files, info):
-    """
-    Procesa una instancia de Camila con los 3 archivos
-    """
-    try:
-        print(f"\n📊 Procesando: {info['fecha']} P{info['participacion']} T{info['turno']:02d}")
-        
-        # Verificar archivos
-        if not files['camila_instance']:
-            print(f"   ❌ Falta archivo de instancia Camila")
-            return False
-        if not files['camila_result']:
-            print(f"   ❌ Falta archivo de resultado Camila")
-            return False
-        if not files['magdalena_instance']:
-            print(f"   ❌ Falta archivo de instancia Magdalena")
-            return False
-        
-        print(f"   📁 Archivos encontrados:")
-        print(f"      - Instancia Camila: {files['camila_instance'].name}")
-        print(f"      - Resultado Camila: {files['camila_result'].name}")
-        print(f"      - Instancia Magdalena: {files['magdalena_instance'].name}")
-        
-        # 1. Leer archivo de instancia de Camila
-        print(f"   📖 Leyendo instancia Camila...")
-        instance_data = loader.read_instance_file(str(files['camila_instance']))
-        
-        # 2. Leer archivo de resultado de Camila
-        print(f"   📖 Leyendo resultados Camila...")
-        results_data = loader.read_results_file(str(files['camila_result']))
-        
-        # 3. Leer demandas por hora desde Magdalena
-        print(f"   📖 Leyendo demandas por hora de Magdalena...")
-        magdalena_data = loader.read_magdalena_files(
-            str(files['magdalena_instance']),
-            '',  # No necesitamos resultado de Magdalena
-            info['turno']
-        )
-        
-        # 4. Combinar datos: usar instancia de Camila pero reemplazar demandas con las de Magdalena
-        if 'demandas_hora' in magdalena_data:
-            print(f"   🔄 Reemplazando demandas con datos horarios de Magdalena...")
-            
-            # Convertir formato de demandas de Magdalena al formato de Camila
-            instance_data['demanda_carga'] = {}
-            instance_data['demanda_descarga'] = {}
-            instance_data['demanda_recepcion'] = {}
-            instance_data['demanda_entrega'] = {}
-            
-            for seg, horas in magdalena_data['demandas_hora'].get('carga', {}).items():
-                instance_data['demanda_carga'][seg] = {i+1: val for i, val in enumerate(horas)}
-            
-            for seg, horas in magdalena_data['demandas_hora'].get('descarga', {}).items():
-                instance_data['demanda_descarga'][seg] = {i+1: val for i, val in enumerate(horas)}
-            
-            for seg, horas in magdalena_data['demandas_hora'].get('recepcion', {}).items():
-                if seg not in instance_data['demanda_recepcion']:
-                    instance_data['demanda_recepcion'] = {}
-                instance_data['demanda_recepcion'][seg] = {i+1: val for i, val in enumerate(horas)}
-            
-            for seg, horas in magdalena_data['demandas_hora'].get('entrega', {}).items():
-                if seg not in instance_data['demanda_entrega']:
-                    instance_data['demanda_entrega'] = {}
-                instance_data['demanda_entrega'][seg] = {i+1: val for i, val in enumerate(horas)}
-        
-        # 5. Crear instancia
-        instance_create = InstanciaCamilaCreate(
-            anio=info['anio'],
-            semana=info['semana'],
-            fecha=info['fecha'],
-            turno=info['turno'],
-            participacion=info['participacion']
-        )
-        
-        # 6. Procesar todo
-        print(f"   💾 Guardando en base de datos...")
-        instancia = await service.process_instance(
-            db=db,
-            instance_data=instance_data,
-            results_data=results_data,
-            instance_create=instance_create
-        )
-        
-        # 7. Guardar referencia a demandas de Magdalena
-        if 'demandas_hora' in magdalena_data:
-            await service._save_magdalena_hourly_demands(
-                db=db,
-                instancia_id=instancia.id,
-                magdalena_instance_id=0,  # No tenemos el ID real
-                demandas_hora=magdalena_data['demandas_hora']
-            )
-        
-        await db.commit()
-        print(f"   ✅ Cargado exitosamente (ID: {instancia.id})")
-        return True
-        
-    except Exception as e:
-        print(f"   ❌ Error: {str(e)}")
-        if os.environ.get("DEBUG"):
-            traceback.print_exc()
-        await db.rollback()
-        return False
-
-async def load_camila_complete():
-    """
-    Carga completa de Camila usando los 3 archivos
-    """
-    # Configurar rutas
-    base_path = Path(os.environ.get('DATA_PATH', '/app/data'))
-    
-    # Rutas de Camila
-    camila_path = base_path / 'camila'
-    camila_instance_path = camila_path / 'instancias'
-    camila_results_path = camila_path / 'resultados'
-    
-    # Rutas de Magdalena
-    magdalena_path = base_path / 'magdalena'
-    magdalena_instance_path = magdalena_path / 'instancias'
-    
-    print(f"📁 Rutas configuradas:")
-    print(f"   - Instancias Camila: {camila_instance_path}")
-    print(f"   - Resultados Camila: {camila_results_path}")
-    print(f"   - Instancias Magdalena: {magdalena_instance_path}")
-    print(f"{'='*80}")
-    
-    # Verificar que existan las rutas
-    for path, nombre in [
-        (camila_instance_path, "Instancias Camila"),
-        (camila_results_path, "Resultados Camila"),
-        (magdalena_instance_path, "Instancias Magdalena")
-    ]:
-        if not path.exists():
-            print(f"❌ No existe el directorio de {nombre}: {path}")
+    # Fallback a ruta local si no existe en Docker
+    if not base_path.exists():
+        local_path = Path('/home/nejoo/gurobi/resultados_generados')
+        if local_path.exists():
+            base_path = local_path
+        else:
+            print(f"❌ No se encontró la ruta de datos en: {optimization_path}")
             return
     
-    # Buscar archivos de Camila
-    camila_files = list(camila_instance_path.glob('Instancia_*.xlsx'))
-    print(f"\n📊 Encontrados {len(camila_files)} archivos de instancia Camila")
+    # Usar las mismas rutas que el script de Magdalena
+    resultados_camila_path = base_path / 'resultados_camila'
+    instancias_camila_path = base_path / 'instancias_camila'
+    resultados_magdalena_path = base_path / 'resultados_magdalena'
+    instancias_magdalena_path = base_path / 'instancias_magdalena'
     
-    # Agrupar por fecha-participación-turno
-    instances_to_process = {}
+    print(f"🔍 Buscando datos de Camila en:")
+    print(f"   - Resultados Camila: {resultados_camila_path}")
+    print(f"   - Instancias Camila: {instancias_camila_path}")
+    print(f"   - Resultados Magdalena: {resultados_magdalena_path}")
+    print(f"   - Instancias Magdalena: {instancias_magdalena_path}")
+    print(f"{'='*80}")
     
-    for file in camila_files:
-        info = parse_camila_filename(file.name)
-        if info:
-            key = (info['fecha'], info['participacion'], info['turno'])
-            instances_to_process[key] = info
+    # Contadores
+    total_archivos = 0
+    archivos_exitosos = 0
+    archivos_fallidos = 0
     
-    print(f"📊 {len(instances_to_process)} instancias únicas para procesar")
+    # Validar formato de fecha ISO
+    def is_valid_iso_date(dirname):
+        """Valida si el nombre del directorio es una fecha ISO válida (YYYY-MM-DD)"""
+        if len(dirname) != 10:
+            return False
+        try:
+            datetime.strptime(dirname, '%Y-%m-%d')
+            return True
+        except ValueError:
+            return False
     
-    # Procesar cada instancia
-    exitosas = 0
-    fallidas = 0
+    # Obtener directorios de resultados
+    if not resultados_camila_path.exists():
+        print(f"❌ No existe el directorio de resultados: {resultados_camila_path}")
+        return
     
-    async with AsyncSessionLocal() as db:
-        service = CamilaService()
-        loader = CamilaLoader()
+    # Buscar directorios con formato resultados_turno_YYYY-MM-DD
+    all_dirs = [d for d in resultados_camila_path.iterdir() if d.is_dir()]
+    turno_dirs = []
+    
+    for d in all_dirs:
+        # Extraer fecha del nombre del directorio
+        if d.name.startswith('resultados_turno_'):
+            fecha_part = d.name.replace('resultados_turno_', '')
+            if is_valid_iso_date(fecha_part):
+                turno_dirs.append((d, fecha_part))
+    
+    # Ordenar por fecha
+    turno_dirs = sorted(turno_dirs, key=lambda x: x[1])
+    
+    print(f"📅 Encontradas {len(turno_dirs)} fechas con resultados de Camila\n")
+    
+    for fecha_dir, fecha_str in turno_dirs:
         
-        # Ordenar por fecha, participación, turno
-        for key in sorted(instances_to_process.keys()):
-            info = instances_to_process[key]
+        try:
+            fecha_inicio = datetime.strptime(fecha_str, '%Y-%m-%d')
+            semana = get_week_from_date(fecha_str)
+            anio = fecha_inicio.year
             
-            # Buscar los 3 archivos
-            files = find_matching_files(
-                camila_instance_path,
-                camila_results_path,
-                magdalena_instance_path,
-                info
-            )
+            print(f"\n📁 Procesando {fecha_str} (Año {anio}, Semana {semana})")
+            print(f"{'-'*60}")
             
-            # Procesar
-            success = await process_camila_instance(db, service, loader, files, info)
+            # Buscar archivos de resultado por turno en Camila
+            # Los archivos están con formato resultados_YYYY-MM-DD_PP_T##.xlsx
+            resultado_files = sorted(list(fecha_dir.glob('resultados_*_T*.xlsx')))
             
-            if success:
-                exitosas += 1
-            else:
-                fallidas += 1
+            # Buscar archivos de instancia en Camila
+            instancia_dir = instancias_camila_path / fecha_str
+            instancia_files = []
+            
+            if instancia_dir.exists():
+                instancia_files = sorted(list(instancia_dir.glob('Instancia_*_T*.xlsx')))
+            
+            # Buscar archivos de Magdalena
+            magdalena_resultado_dir = resultados_magdalena_path / fecha_str
+            magdalena_instancia_dir = instancias_magdalena_path / fecha_str
+            
+            print(f"   Encontrados:")
+            print(f"   - {len(resultado_files)} archivos de resultado Camila")
+            print(f"   - {len(instancia_files)} archivos de instancia Camila")
+            
+            # Procesar cada turno
+            for resultado_file in resultado_files:
+                total_archivos += 1
+                
+                # Extraer información del archivo
+                turno = parse_turno_from_filename(resultado_file.name)
+                if turno is None:
+                    print(f"   ⚠️ No se pudo extraer turno de: {resultado_file.name}")
+                    continue
+                
+                # Extraer participación del nombre
+                # Formato: resultado_20220103_68_T01.xlsx
+                parts = resultado_file.stem.split('_')
+                participacion = None
+                
+                for part in parts:
+                    if part.isdigit() and 60 <= int(part) <= 80 and len(part) <= 3:
+                        participacion = int(part)
+                        break
+                
+                if participacion is None:
+                    print(f"   ⚠️ No se pudo extraer participación de: {resultado_file.name}")
+                    continue
+                
+                print(f"\n   📊 Procesando Turno {turno:02d} - P{participacion}")
+                
+                # Buscar instancia correspondiente de Camila
+                instancia_file = None
+                for inst in instancia_files:
+                    # Buscar coincidencia por turno y participación
+                    if (f"_T{turno:02d}" in inst.name or f"_T{turno}" in inst.name) and f"_{participacion}_" in inst.name:
+                        instancia_file = inst
+                        break
+                
+                # Buscar archivo de resultado de Magdalena correspondiente
+                magdalena_file = None
+                con_dispersion = None
+                
+                if magdalena_resultado_dir.exists():
+                    # Buscar archivo de Magdalena con misma participación
+                    # Intentar con K primero
+                    magdalena_pattern_k = f"resultado_*_{participacion}_K.xlsx"
+                    magdalena_files_k = list(magdalena_resultado_dir.glob(magdalena_pattern_k))
+                    
+                    # Luego con N
+                    magdalena_pattern_n = f"resultado_*_{participacion}_N.xlsx"
+                    magdalena_files_n = list(magdalena_resultado_dir.glob(magdalena_pattern_n))
+                    
+                    if magdalena_files_k:
+                        magdalena_file = magdalena_files_k[0]
+                        con_dispersion = True
+                    elif magdalena_files_n:
+                        magdalena_file = magdalena_files_n[0]
+                        con_dispersion = False
+                
+                # Buscar instancia de Magdalena
+                magdalena_instancia_file = None
+                if magdalena_instancia_dir.exists() and con_dispersion is not None:
+                    dispersion_char = 'K' if con_dispersion else 'N'
+                    magdalena_inst_pattern = f"Instancia_*_{participacion}_{dispersion_char}.xlsx"
+                    magdalena_inst_files = list(magdalena_instancia_dir.glob(magdalena_inst_pattern))
+                    if magdalena_inst_files:
+                        magdalena_instancia_file = magdalena_inst_files[0]
+                
+                print(f"      - Resultado Camila: {resultado_file.name}")
+                print(f"      - Instancia Camila: {instancia_file.name if instancia_file else 'No encontrada'}")
+                print(f"      - Resultado Magdalena: {magdalena_file.name if magdalena_file else 'No encontrado'}")
+                print(f"      - Instancia Magdalena: {magdalena_instancia_file.name if magdalena_instancia_file else 'No encontrada'}")
+                print(f"      - Dispersión: {'K' if con_dispersion else 'N' if con_dispersion is not None else 'No determinada'}")
+                
+                # Si no se pudo determinar la dispersión, asumir K por defecto
+                if con_dispersion is None:
+                    con_dispersion = True
+                    print(f"      - Asumiendo dispersión K por defecto")
+                
+                try:
+                    async with AsyncSessionLocal() as db:
+                        # IMPORTANTE: Pasar la sesión de base de datos al constructor
+                        loader = CamilaLoader(db)
+                        
+                        resultado_id = await loader.load_camila_results(
+                            resultado_filepath=str(resultado_file),
+                            instancia_filepath=str(instancia_file) if instancia_file else None,
+                            magdalena_resultado_filepath=str(magdalena_file) if magdalena_file else None,
+                            fecha_inicio=fecha_inicio,
+                            semana=semana,
+                            anio=anio,
+                            turno=turno,
+                            participacion=participacion,
+                            con_dispersion=con_dispersion
+                        )
+                        
+                        await db.commit()
+                        print(f"   ✅ Cargado exitosamente (ID: {resultado_id})")
+                        archivos_exitosos += 1
+                        
+                except Exception as e:
+                    print(f"   ❌ Error: {str(e)}")
+                    if os.environ.get("DEBUG"):
+                        traceback.print_exc()
+                    archivos_fallidos += 1
+                    
+        except Exception as e:
+            print(f"⚠️ Error procesando {fecha_str}: {str(e)}")
+            continue
     
-    # Resumen
+    # Resumen final
     print(f"\n{'='*80}")
-    print(f"✅ CARGA COMPLETA - {datetime.now()}")
+    print(f"✅ CARGA COMPLETA DE CAMILA - {datetime.now()}")
     print(f"{'='*80}")
-    print(f"📊 RESUMEN:")
-    print(f"   - Instancias procesadas: {exitosas + fallidas}")
-    print(f"   - Exitosas: {exitosas}")
-    print(f"   - Fallidas: {fallidas}")
-    print(f"   - Tasa de éxito: {(exitosas/(exitosas+fallidas)*100):.1f}%" if (exitosas+fallidas) > 0 else "N/A")
-
-async def verify_database():
-    """Verifica los datos cargados"""
-    async with AsyncSessionLocal() as db:
-        print(f"\n📊 VERIFICACIÓN EN BASE DE DATOS:")
-        
-        # Consultas básicas
-        queries = {
-            'Total instancias': "SELECT COUNT(*) FROM instancia_camila",
-            'Instancias completadas': "SELECT COUNT(*) FROM instancia_camila WHERE estado = 'completado'",
-            'Con demandas Magdalena': "SELECT COUNT(DISTINCT instancia_id) FROM demanda_hora_magdalena",
-            'Total métricas': "SELECT COUNT(*) FROM metrica_resultado",
-            'Total flujos': "SELECT COUNT(*) FROM flujo_operacional WHERE flujo_carga + flujo_descarga + flujo_recepcion + flujo_entrega > 0"
-        }
-        
-        for nombre, query in queries.items():
-            result = await db.execute(text(query))
-            count = result.scalar()
-            print(f"   - {nombre}: {count:,}")
-        
-        # Estadísticas detalladas
-        print(f"\n📈 ESTADÍSTICAS POR AÑO-SEMANA:")
-        stats_query = """
-            SELECT 
-                anio,
-                semana,
-                COUNT(*) as instancias,
-                COUNT(DISTINCT turno) as turnos,
-                COUNT(DISTINCT participacion) as participaciones,
-                AVG(CAST(m.valor_funcion_objetivo AS FLOAT)) as fo_promedio
-            FROM instancia_camila i
-            LEFT JOIN metrica_resultado m ON i.id = m.instancia_id
-            WHERE i.estado = 'completado'
-            GROUP BY anio, semana
-            ORDER BY anio DESC, semana DESC
-            LIMIT 10
-        """
-        result = await db.execute(text(stats_query))
-        for row in result:
-            print(f"   {row.anio}-S{row.semana:02d}: "
-                  f"{row.instancias} inst, {row.turnos} turnos, "
-                  f"{row.participaciones} part, FO={row.fo_promedio:.2f}" 
-                  if row.fo_promedio else "")
-
-async def main():
-    """Función principal"""
-    import argparse
+    print(f"📊 RESUMEN FINAL:")
+    print(f"   - Total archivos procesados: {total_archivos}")
+    print(f"   - Exitosos: {archivos_exitosos}")
+    print(f"   - Fallidos: {archivos_fallidos}")
+    print(f"   - Tasa de éxito: {(archivos_exitosos/total_archivos*100):.1f}%" if total_archivos > 0 else "N/A")
     
-    parser = argparse.ArgumentParser(
-        description='Cargar datos de Camila usando los 3 archivos (Instancia Camila, Resultado Camila, Instancia Magdalena)'
-    )
-    parser.add_argument('--debug', action='store_true', help='Mostrar errores detallados')
-    parser.add_argument('--verify-only', action='store_true', help='Solo verificar BD sin cargar')
-    parser.add_argument('--data-path', help='Ruta base de los datos', default='/app/data')
-    
-    args = parser.parse_args()
-    
-    if args.debug:
-        os.environ['DEBUG'] = '1'
-    
-    if args.data_path:
-        os.environ['DATA_PATH'] = args.data_path
-    
-    print(f"🚀 CARGA DE DATOS DE CAMILA (3 ARCHIVOS) - {datetime.now()}")
-    print(f"{'='*80}")
-    
-    if args.verify_only:
-        await verify_database()
-    else:
-        await load_camila_complete()
-        await verify_database()
+    # Verificación en base de datos
+    try:
+        async with AsyncSessionLocal() as db:
+            from sqlalchemy import text
+            
+            # Contar registros en tablas principales
+            queries = {
+                'resultados_camila': "SELECT COUNT(*) FROM resultados_camila WHERE estado = 'completado'",
+                'asignaciones_gruas': "SELECT COUNT(*) FROM asignaciones_gruas",
+                'cuotas_camiones': "SELECT COUNT(*) FROM cuotas_camiones",
+                'metricas_gruas': "SELECT COUNT(*) FROM metricas_gruas",
+                'comparaciones_camila': "SELECT COUNT(*) FROM comparaciones_camila"
+            }
+            
+            print(f"\n📊 VERIFICACIÓN EN BASE DE DATOS:")
+            for tabla, query in queries.items():
+                result = await db.execute(text(query))
+                count = result.scalar()
+                print(f"   - {tabla}: {count:,}")
+            
+            # Estadísticas por año
+            print(f"\n📅 RESULTADOS POR AÑO:")
+            year_query = """
+                SELECT anio, COUNT(*) as total, 
+                       COUNT(DISTINCT semana) as semanas,
+                       COUNT(DISTINCT turno) as turnos,
+                       COUNT(DISTINCT participacion) as participaciones
+                FROM resultados_camila 
+                WHERE estado = 'completado'
+                GROUP BY anio 
+                ORDER BY anio
+            """
+            result = await db.execute(text(year_query))
+            for row in result:
+                print(f"   - {row.anio}: {row.total} resultados, {row.semanas} semanas, "
+                      f"{row.turnos} turnos, {row.participaciones} participaciones")
+                
+    except Exception as e:
+        print(f"\n⚠️ No se pudo verificar la base de datos: {str(e)}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    print(f"🚀 Iniciando carga de datos de Camila - {datetime.now()}")
+    print(f"="*80)
+    asyncio.run(load_camila_data())

@@ -1,1768 +1,555 @@
-# app/services/camila_service.py
-import logging
-from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime, time, timedelta
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_
-from sqlalchemy.orm import selectinload
+import pandas as pd
 import numpy as np
-import asyncio
+from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime, timedelta
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete, and_, func
+import logging
+from uuid import UUID
+import re
+import json
+from pathlib import Path
 
-# Importar modelos de Camila
-from app.models.camila import (
-    InstanciaCamila, Bloque, Segregacion, Grua, PeriodoHora,
-    ParametroGeneral, InventarioInicial, DemandaOperacion,
-    CapacidadBloque, AsignacionGrua, FlujoOperacional,
-    CuotaCamion, DisponibilidadBloque, MetricaResultado,
-    ProductividadGrua, IntegracionMagdalena, DemandaHoraMagdalena,
-    ConfiguracionSistema, ConfiguracionInstancia
-)
-
-# Importar modelos de Magdalena
-from app.models.optimization import (
-    Instancia as InstanciaMagdalena,
-    MovimientoModelo,
-    Bloque as BloqueMagdalena,
-    Segregacion as SegregacionMagdalena,
-    OcupacionBloque
-)
-
-from app.schemas.camila import (
-    InstanciaCamilaCreate, DashboardResponse, KPIBalance,
-    KPIGruas, KPIFlujos, KPICamiones, EstadoInstancia
-)
-from .camila_loader import CamilaLoader
+from app.models.camila import *
 
 logger = logging.getLogger(__name__)
 
-class CamilaService:
-    """Servicio principal para el modelo Camila"""
+class CamilaLoader:
+    """Servicio para cargar datos del modelo Camila"""
     
-    def __init__(self):
-        self.loader = CamilaLoader()
-    
-    async def process_instance(
+    def __init__(self, db: AsyncSession):
+        self.db = db
+        self.validation_errors = []
+        self.warnings = []
+        
+    async def load_camila_results(
         self,
-        db: AsyncSession,
-        instance_data: Dict[str, Any],
-        results_data: Dict[str, Any],
-        instance_create: InstanciaCamilaCreate
-    ) -> InstanciaCamila:
-        """Procesa una instancia completa de Camila"""
+        resultado_filepath: str,
+        instancia_filepath: Optional[str],
+        magdalena_resultado_filepath: Optional[str],
+        fecha_inicio: datetime,
+        semana: int,
+        anio: int,
+        turno: int,
+        participacion: int,
+        con_dispersion: bool
+    ) -> UUID:
+        """Carga completa de resultados de Camila para un turno específico"""
+        
+        logger.info(f"{'='*80}")
+        logger.info(f"Iniciando carga de Camila")
+        logger.info(f"Turno: {turno}, Fecha: {fecha_inicio.date()}")
+        logger.info(f"Config: Año {anio}, Semana {semana}, P{participacion}, Disp={'K' if con_dispersion else 'N'}")
+        
         try:
-            # Crear instancia
-            instancia = await self._create_instance(db, instance_create)
+            # Crear o actualizar resultado de Camila
+            resultado_camila = await self._create_or_update_resultado(
+                fecha_inicio, semana, anio, turno, participacion, con_dispersion
+            )
             
-            # Actualizar estado
-            instancia.estado = EstadoInstancia.ejecutando
-            await db.commit()
+            # Cargar archivo de resultado
+            stats_resultado = await self._load_resultado_file(resultado_filepath, resultado_camila.id)
             
-            # Procesar datos en orden
-            await self._ensure_master_data(db)
-            await self._process_parameters(db, instancia, instance_data['parametros'])
-            await self._process_periods(db, instancia)
-            await self._process_initial_inventory(db, instancia, instance_data)
-            await self._process_demands(db, instancia, instance_data)
-            await self._process_capacities(db, instancia, instance_data)
+            # Cargar archivo de instancia si existe
+            stats_instancia = {}
+            if instancia_filepath and Path(instancia_filepath).exists():
+                stats_instancia = await self._load_instancia_file(instancia_filepath, resultado_camila.id)
             
-            # Procesar resultados
-            await self._process_crane_assignments(db, instancia, results_data['asignacion_gruas'])
-            await self._process_flows(db, instancia, results_data)
-            await self._process_availability(db, instancia, results_data)
-            await self._process_quotas(db, instancia, results_data['cuotas'])
+            # Cargar información de Magdalena si existe
+            stats_magdalena = {}
+            if magdalena_resultado_filepath and Path(magdalena_resultado_filepath).exists():
+                stats_magdalena = await self._load_magdalena_info(
+                    magdalena_resultado_filepath, resultado_camila.id, turno
+                )
             
             # Calcular métricas
-            await self._calculate_metrics(db, instancia, results_data['metricas'])
+            await self._calculate_metrics(resultado_camila.id, stats_resultado, stats_magdalena)
             
-            # Actualizar estado final
-            instancia.estado = EstadoInstancia.completado
-            instancia.fecha_ejecucion = datetime.utcnow()
-            await db.commit()
+            # Calcular comparaciones si hay datos de Magdalena
+            if stats_magdalena:
+                await self._calculate_comparisons(resultado_camila.id, stats_magdalena)
             
-            logger.info(f"Instancia {instancia.id} procesada exitosamente")
-            return instancia
+            # Actualizar estado
+            resultado_camila.estado = 'completado'
+            resultado_camila.fecha_procesamiento = datetime.utcnow()
+            
+            # Commit final
+            await self.db.commit()
+            
+            # Log resumen
+            self._log_summary(resultado_camila.id, stats_resultado, stats_instancia, stats_magdalena)
+            
+            return resultado_camila.id
             
         except Exception as e:
-            logger.error(f"Error procesando instancia: {str(e)}")
-            if instancia:
-                instancia.estado = EstadoInstancia.error
-                instancia.mensaje_error = str(e)
-                await db.commit()
+            await self.db.rollback()
+            logger.error(f"❌ Error cargando Camila: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             raise
     
-    async def import_from_magdalena(
-        self,
-        db: AsyncSession,
-        magdalena_instance_id: int,
-        turno: int,
-        instance_filepath: str,
-        result_filepath: str,
-        instance_create: InstanciaCamilaCreate
-    ) -> InstanciaCamila:
-        """Importa datos desde Magdalena usando BD y archivos"""
+    async def _create_or_update_resultado(
+        self, fecha_inicio: datetime, semana: int, anio: int,
+        turno: int, participacion: int, con_dispersion: bool
+    ) -> ResultadoCamila:
+        """Crea o actualiza un resultado de Camila"""
+        
+        # Calcular día basado en fecha
+        dia = ((turno - 1) // 3) + 1
+        turno_del_dia = ((turno - 1) % 3) + 1
+        
+        # Calcular fecha/hora específica del turno
+        hora_inicio = {1: 8, 2: 16, 3: 0}[turno_del_dia]
+        fecha_turno = fecha_inicio + timedelta(days=dia-1, hours=hora_inicio)
+        
+        # Generar código único
+        fecha_str = fecha_inicio.strftime('%Y%m%d')
+        dispersion_str = 'K' if con_dispersion else 'N'
+        codigo = f"{fecha_str}_{participacion}_{dispersion_str}_T{turno:02d}"
+        
+        # Buscar resultado existente
+        query = select(ResultadoCamila).where(ResultadoCamila.codigo == codigo)
+        result = await self.db.execute(query)
+        resultado = result.scalar_one_or_none()
+        
+        if resultado:
+            logger.info(f"Actualizando resultado existente: {resultado.id}")
+            # Limpiar datos anteriores
+            await self._delete_resultado_data(resultado.id)
+            resultado.fecha_procesamiento = datetime.utcnow()
+        else:
+            logger.info("Creando nuevo resultado")
+            resultado = ResultadoCamila(
+                codigo=codigo,
+                fecha_inicio=fecha_turno,
+                fecha_fin=fecha_turno + timedelta(hours=8),
+                anio=anio,
+                semana=semana,
+                dia=dia,
+                turno=turno,
+                turno_del_dia=turno_del_dia,
+                participacion=participacion,
+                con_dispersion=con_dispersion,
+                estado='procesando',
+                fecha_procesamiento=datetime.utcnow()
+            )
+            self.db.add(resultado)
+            await self.db.flush()
+        
+        logger.info(f"Resultado ID: {resultado.id}, Código: {codigo}")
+        return resultado
+    
+    async def _delete_resultado_data(self, resultado_id: UUID):
+        """Elimina datos anteriores de un resultado"""
+        logger.info(f"Eliminando datos anteriores del resultado {resultado_id}")
+        
+        await self.db.execute(delete(AsignacionGrua).where(AsignacionGrua.resultado_id == resultado_id))
+        await self.db.execute(delete(CuotaCamion).where(CuotaCamion.resultado_id == resultado_id))
+        await self.db.execute(delete(MetricaGrua).where(MetricaGrua.resultado_id == resultado_id))
+        await self.db.execute(delete(ComparacionCamila).where(ComparacionCamila.resultado_id == resultado_id))
+        await self.db.flush()
+    
+    async def _load_resultado_file(self, filepath: str, resultado_id: UUID) -> Dict[str, Any]:
+        """Carga archivo de resultados de Camila"""
+        
+        logger.info("Cargando archivo de resultados de Camila...")
+        
         try:
-            # Verificar que existe la instancia de Magdalena
-            result = await db.execute(
-                select(InstanciaMagdalena)
-                .where(InstanciaMagdalena.id == magdalena_instance_id)
-            )
-            instancia_magdalena = result.scalar_one_or_none()
+            df = pd.read_excel(filepath, header=None)
+            logger.info(f"Archivo con {len(df)} filas")
             
-            if not instancia_magdalena:
-                raise ValueError(f"Instancia Magdalena {magdalena_instance_id} no encontrada")
+            stats = {
+                'total_asignaciones': 0,
+                'bloques_visitados': set(),
+                'segregaciones_atendidas': set(),
+                'periodos_activos': set(),
+                'frecuencias_totales': 0
+            }
             
-            # Crear instancia Camila
-            instancia = await self._create_instance(db, instance_create)
+            batch_asignaciones = []
+            batch_cuotas = []
             
-            # Crear registro de integración
-            integracion = IntegracionMagdalena(
-                instancia_camila_id=instancia.id,
-                magdalena_instance_id=magdalena_instance_id,
-                estado_importacion='procesando',
-                archivo_instancia_magdalena=instance_filepath,
-                archivo_resultado_magdalena=result_filepath
-            )
-            db.add(integracion)
-            await db.commit()
+            for idx, row in df.iterrows():
+                try:
+                    if len(row) < 3:
+                        continue
+                    
+                    var_name = str(row[0]).strip()
+                    var_index = str(row[1]).strip()
+                    var_value = float(row[2]) if pd.notna(row[2]) else 0
+                    
+                    if var_value == 0:
+                        continue
+                    
+                    # Procesar variable fr_sbt (frecuencia segregación-bloque-tiempo)
+                    if var_name == 'fr_sbt':
+                        # Parsear índice: ('s8', 'b1', 4)
+                        match = re.match(r"\('([^']+)',\s*'([^']+)',\s*(\d+)\)", var_index)
+                        if match:
+                            segregacion = match.group(1)
+                            bloque = match.group(2)
+                            periodo = int(match.group(3))
+                            
+                            # Mapear códigos
+                            bloque_codigo = bloque.upper().replace('B', 'C')  # b1 -> C1
+                            segregacion_codigo = segregacion.upper()  # s8 -> S8
+                            
+                            asignacion = AsignacionGrua(
+                                resultado_id=resultado_id,
+                                segregacion_codigo=segregacion_codigo,
+                                bloque_codigo=bloque_codigo,
+                                periodo=periodo,
+                                frecuencia=int(var_value),
+                                tipo_asignacion='regular'
+                            )
+                            batch_asignaciones.append(asignacion)
+                            
+                            stats['total_asignaciones'] += 1
+                            stats['bloques_visitados'].add(bloque_codigo)
+                            stats['segregaciones_atendidas'].add(segregacion_codigo)
+                            stats['periodos_activos'].add(periodo)
+                            stats['frecuencias_totales'] += int(var_value)
+                    
+                    # Aquí podrías procesar otras variables si las hay
+                    
+                except Exception as e:
+                    logger.warning(f"Error en fila {idx}: {str(e)}")
             
-            # Leer archivos de Magdalena
-            magdalena_data = self.loader.read_magdalena_files(
-                instance_filepath,
-                result_filepath,
-                turno
-            )
+            # Guardar en batches
+            if batch_asignaciones:
+                self.db.add_all(batch_asignaciones)
+                await self.db.flush()
             
-            # Procesar datos
-            await self._ensure_master_data(db)
+            # Calcular cuotas de camiones basadas en las asignaciones
+            await self._calculate_truck_quotas(resultado_id, batch_asignaciones)
             
-            # 1. Importar segregaciones
-            await self._import_segregaciones(db, magdalena_data['segregaciones'])
-            
-            # 2. Importar inventarios desde BD
-            inventarios = await self._get_inventarios_from_magdalena_db(db, magdalena_instance_id, turno)
-            await self._process_inventories_magdalena(db, instancia, inventarios)
-            
-            # 3. Importar capacidades desde BD
-            capacidades = await self._get_capacidades_from_magdalena_db(db, magdalena_instance_id, turno)
-            await self._process_capacities_magdalena(db, instancia, capacidades)
-            
-            # 4. Importar demandas POR HORA desde archivo
-            await self._process_demands_magdalena(db, instancia, magdalena_data['demandas_hora'])
-            
-            # 5. Guardar demandas en tabla específica
-            await self._save_magdalena_hourly_demands(
-                db, 
-                instancia.id, 
-                magdalena_instance_id,
-                magdalena_data['demandas_hora']
-            )
-            
-            # Actualizar integración
-            integracion.estado_importacion = 'completado'
-            integracion.datos_inventario = inventarios
-            integracion.datos_capacidad = capacidades
-            integracion.datos_demanda = magdalena_data['demandas_hora']
-            await db.commit()
-            
-            logger.info(f"Datos importados desde Magdalena para instancia {instancia.id}")
-            return instancia
+            logger.info(f"Resultados cargados: {stats}")
+            return stats
             
         except Exception as e:
-            logger.error(f"Error importando desde Magdalena: {str(e)}")
-            if integracion:
-                integracion.estado_importacion = 'error'
-                integracion.mensaje_error = str(e)
-                await db.commit()
+            logger.error(f"Error cargando resultados: {e}")
             raise
     
-    async def get_dashboard(self, db: AsyncSession, instance_id: int) -> DashboardResponse:
-        """Obtiene datos del dashboard para una instancia"""
-        # Obtener instancia con relaciones
-        result = await db.execute(
-            select(InstanciaCamila)
-            .options(
-                selectinload(InstanciaCamila.metricas),
-selectinload(InstanciaCamila.flujos),
-                selectinload(InstanciaCamila.cuotas)
-            )
-            .where(InstanciaCamila.id == instance_id)
-        )
-        instancia = result.scalar_one_or_none()
+    async def _load_instancia_file(self, filepath: str, resultado_id: UUID) -> Dict[str, Any]:
+        """Carga archivo de instancia de Camila"""
         
-        if not instancia:
-            raise ValueError(f"Instancia {instance_id} no encontrada")
+        logger.info("Cargando archivo de instancia de Camila...")
         
-        # Obtener métricas
-        metricas = instancia.metricas
-        if not metricas:
-            raise ValueError(f"No hay métricas calculadas para instancia {instance_id}")
-        
-        # Obtener configuraciones
-        tiempo_espera = await self._get_config_value(db, 'tiempo_espera_estimado', 25)
-        
-        # Construir KPIs
-        balance = KPIBalance(
-            funcion_objetivo=metricas.valor_funcion_objetivo,
-            coeficiente_variacion=metricas.coeficiente_variacion,
-            indice_balance=metricas.indice_balance,
-            desviacion_estandar=metricas.desviacion_estandar_carga
-        )
-        
-        gruas = KPIGruas(
-            utilizacion_promedio=metricas.utilizacion_gruas_pct,
-            gruas_activas_promedio=metricas.gruas_utilizadas_promedio,
-            productividad_promedio=metricas.productividad_promedio,
-            cambios_totales=metricas.cambios_bloque_total,
-            eficiencia_pct=(metricas.productividad_promedio / 20) * 100  # 20 es productividad nominal
-        )
-        
-        # Calcular distribución de flujos
-        flujos_result = await db.execute(
-            select(
-                func.sum(FlujoOperacional.flujo_carga).label('carga'),
-                func.sum(FlujoOperacional.flujo_descarga).label('descarga'),
-                func.sum(FlujoOperacional.flujo_recepcion).label('recepcion'),
-                func.sum(FlujoOperacional.flujo_entrega).label('entrega')
-            )
-            .where(FlujoOperacional.instancia_id == instance_id)
-        )
-        flujos_data = flujos_result.first()
-        
-        flujos = KPIFlujos(
-            movimientos_totales=metricas.movimientos_totales,
-            cumplimiento_carga=metricas.cumplimiento_carga_pct,
-            cumplimiento_descarga=metricas.cumplimiento_descarga_pct,
-            cumplimiento_recepcion=metricas.cumplimiento_recepcion_pct,
-            cumplimiento_entrega=metricas.cumplimiento_entrega_pct,
-            distribucion={
-                'carga': flujos_data.carga or 0,
-                'descarga': flujos_data.descarga or 0,
-                'recepcion': flujos_data.recepcion or 0,
-                'entrega': flujos_data.entrega or 0
+        try:
+            xl = pd.ExcelFile(filepath)
+            stats = {
+                'parametros_cargados': 0,
+                'demanda_total': 0,
+                'gruas_disponibles': 0
             }
-        )
-        
-        # Obtener cuotas
-        cuotas_result = await db.execute(
-            select(
-                func.min(CuotaCamion.cuota_total).label('minima'),
-                func.max(CuotaCamion.cuota_total).label('maxima')
-            )
-            .where(CuotaCamion.instancia_id == instance_id)
-        )
-        cuotas_data = cuotas_result.first()
-        
-        camiones = KPICamiones(
-            cuota_total=metricas.cuota_total_turno,
-            cuota_promedio=metricas.cuota_promedio_hora,
-            cuota_maxima=cuotas_data.maxima or 0,
-            cuota_minima=cuotas_data.minima or 0,
-            uniformidad=metricas.uniformidad_cuotas,
-            tiempo_espera_promedio=tiempo_espera
-        )
-        
-        return DashboardResponse(
-            instancia=instancia,
-            balance=balance,
-            gruas=gruas,
-            flujos=flujos,
-            camiones=camiones,
-            congestion_maxima=metricas.congestion_maxima,
-            bloque_mas_congestionado=metricas.bloque_mas_congestionado,
-            hora_pico=metricas.hora_pico
-        )
-    
-    async def get_crane_assignments(self, db: AsyncSession, instance_id: int) -> Dict[str, Any]:
-        """Obtiene asignaciones de grúas por hora"""
-        result = await db.execute(
-            select(AsignacionGrua, Grua, Bloque, PeriodoHora)
-            .join(Grua)
-            .join(Bloque)
-            .join(PeriodoHora)
-            .where(
-                and_(
-                    AsignacionGrua.instancia_id == instance_id,
-                    AsignacionGrua.asignada == True
-                )
-            )
-            .order_by(PeriodoHora.hora_relativa, Grua.codigo)
-        )
-        
-        asignaciones = []
-        gruas_por_hora = {}
-        
-        for asig, grua, bloque, periodo in result:
-            asignaciones.append({
-                'grua': grua.codigo,
-                'bloque': bloque.codigo,
-                'hora': periodo.hora_relativa,
-                'productividad': asig.productividad_real,
-                'movimientos': asig.movimientos_realizados
-            })
             
-            if periodo.hora_relativa not in gruas_por_hora:
-                gruas_por_hora[periodo.hora_relativa] = 0
-            gruas_por_hora[periodo.hora_relativa] += 1
-        
-        # Calcular cambios de bloque
-        cambios_por_grua = await self._calculate_block_changes(db, instance_id)
-        
-        return {
-            'instancia_id': instance_id,
-            'asignaciones': asignaciones,
-            'resumen': {
-                'gruas_por_hora': gruas_por_hora,
-                'cambios_por_grua': cambios_por_grua,
-                'total_cambios': sum(cambios_por_grua.values())
-            }
-        }
-    
-    async def get_flows(self, db: AsyncSession, instance_id: int) -> Dict[str, Any]:
-        """Obtiene flujos operacionales"""
-        # Por hora
-        result_hora = await db.execute(
-            select(
-                PeriodoHora.hora_relativa,
-                func.sum(FlujoOperacional.flujo_carga).label('carga'),
-                func.sum(FlujoOperacional.flujo_descarga).label('descarga'),
-                func.sum(FlujoOperacional.flujo_recepcion).label('recepcion'),
-                func.sum(FlujoOperacional.flujo_entrega).label('entrega')
-            )
-            .join(PeriodoHora)
-            .where(FlujoOperacional.instancia_id == instance_id)
-            .group_by(PeriodoHora.hora_relativa)
-            .order_by(PeriodoHora.hora_relativa)
-        )
-        
-        flujos_hora = []
-        for row in result_hora:
-            flujos_hora.append({
-                'hora': row.hora_relativa,
-                'carga': row.carga or 0,
-                'descarga': row.descarga or 0,
-                'recepcion': row.recepcion or 0,
-                'entrega': row.entrega or 0,
-                'total': (row.carga or 0) + (row.descarga or 0) + 
-                        (row.recepcion or 0) + (row.entrega or 0)
-            })
-        
-        # Por bloque
-        result_bloque = await db.execute(
-            select(
-                Bloque.codigo,
-                func.sum(FlujoOperacional.flujo_carga).label('carga'),
-                func.sum(FlujoOperacional.flujo_descarga).label('descarga'),
-                func.sum(FlujoOperacional.flujo_recepcion).label('recepcion'),
-                func.sum(FlujoOperacional.flujo_entrega).label('entrega')
-            )
-            .join(Bloque)
-            .where(FlujoOperacional.instancia_id == instance_id)
-            .group_by(Bloque.codigo)
-            .order_by(Bloque.codigo)
-        )
-        
-        flujos_bloque = []
-        totales = {'carga': 0, 'descarga': 0, 'recepcion': 0, 'entrega': 0}
-        
-        for row in result_bloque:
-            total_bloque = (row.carga or 0) + (row.descarga or 0) + \
-                          (row.recepcion or 0) + (row.entrega or 0)
+            # Cargar parámetros básicos
+            if 'mu' in xl.sheet_names:
+                df_mu = pd.read_excel(xl, 'mu', header=None)
+                if len(df_mu) > 1:
+                    productividad = float(df_mu.iloc[1, 0])
+                    stats['productividad'] = productividad
+                    stats['parametros_cargados'] += 1
             
-            flujos_bloque.append({
-                'bloque': row.codigo,
-                'carga': row.carga or 0,
-                'descarga': row.descarga or 0,
-                'recepcion': row.recepcion or 0,
-                'entrega': row.entrega or 0,
-                'total': total_bloque
-            })
+            if 'W' in xl.sheet_names:
+                df_w = pd.read_excel(xl, 'W', header=None)
+                if len(df_w) > 1:
+                    ventana_tiempo = float(df_w.iloc[1, 0])
+                    stats['ventana_tiempo'] = ventana_tiempo
+                    stats['parametros_cargados'] += 1
             
-            totales['carga'] += row.carga or 0
-            totales['descarga'] += row.descarga or 0
-            totales['recepcion'] += row.recepcion or 0
-            totales['entrega'] += row.entrega or 0
-        
-        return {
-            'instancia_id': instance_id,
-            'por_hora': flujos_hora,
-            'por_bloque': flujos_bloque,
-            'totales': totales
-        }
-    
-    async def get_truck_quotas(self, db: AsyncSession, instance_id: int) -> Dict[str, Any]:
-        """Obtiene cuotas de camiones"""
-        result = await db.execute(
-            select(CuotaCamion, PeriodoHora)
-            .join(PeriodoHora)
-            .where(CuotaCamion.instancia_id == instance_id)
-            .order_by(PeriodoHora.hora_relativa)
-        )
-        
-        cuotas = []
-        total_turno = 0
-        
-        for cuota, periodo in result:
-            cuotas.append({
-                'hora': periodo.hora_relativa,
-                'hora_inicio': periodo.hora_inicio,
-                'hora_fin': periodo.hora_fin,
-                'cuota_recepcion': cuota.cuota_recepcion,
-                'cuota_entrega': cuota.cuota_entrega,
-                'cuota_total': cuota.cuota_total,
-                'capacidad_disponible': cuota.capacidad_disponible,
-                'utilizacion_esperada': cuota.utilizacion_esperada
-            })
-            total_turno += cuota.cuota_total
-        
-        # Calcular uniformidad
-        if cuotas:
-            cuotas_valores = [c['cuota_total'] for c in cuotas]
-            promedio = np.mean(cuotas_valores)
-            desviacion = np.std(cuotas_valores)
-            uniformidad = 1 - (desviacion / promedio) if promedio > 0 else 0
-        else:
-            promedio = 0
-            uniformidad = 0
-        
-        return {
-            'instancia_id': instance_id,
-            'cuotas': cuotas,
-            'total_turno': total_turno,
-            'promedio_hora': promedio,
-            'uniformidad': uniformidad
-        }
-    
-    async def get_balance_by_block(self, db: AsyncSession, instance_id: int) -> Dict[str, Any]:
-        """Obtiene balance de carga por bloque"""
-        # Movimientos por bloque
-        result_mov = await db.execute(
-            select(
-                Bloque.codigo,
-                func.sum(
-                    FlujoOperacional.flujo_carga + 
-                    FlujoOperacional.flujo_descarga +
-                    FlujoOperacional.flujo_recepcion + 
-                    FlujoOperacional.flujo_entrega
-                ).label('movimientos_totales')
-            )
-            .join(Bloque)
-            .where(FlujoOperacional.instancia_id == instance_id)
-            .group_by(Bloque.codigo)
-        )
-        
-        movimientos_bloque = {row.codigo: row.movimientos_totales or 0 for row in result_mov}
-        
-        # Utilización y congestión
-        result_util = await db.execute(
-            select(
-                Bloque.codigo,
-                func.avg(DisponibilidadBloque.utilizacion_pct).label('util_promedio'),
-                func.max(DisponibilidadBloque.congestion_index).label('congestion_max')
-            )
-            .join(Bloque)
-            .where(DisponibilidadBloque.instancia_id == instance_id)
-            .group_by(Bloque.codigo)
-        )
-        
-        utilizacion_bloque = {
-            row.codigo: {
-                'utilizacion': row.util_promedio or 0,
-                'congestion': row.congestion_max or 0
-            }
-            for row in result_util
-        }
-        
-        # Grúas asignadas
-        result_gruas = await db.execute(
-            select(
-                Bloque.codigo,
-                func.count(func.distinct(AsignacionGrua.grua_id)).label('gruas')
-            )
-            .join(Bloque)
-            .where(
-                and_(
-                    AsignacionGrua.instancia_id == instance_id,
-                    AsignacionGrua.asignada == True
-                )
-            )
-            .group_by(Bloque.codigo)
-        )
-        
-        gruas_bloque = {row.codigo: row.gruas for row in result_gruas}
-        
-        # Obtener capacidad desde configuración
-        capacidad_default = await self._get_config_value(db, 'capacidad_bloque_default', 1820)
-        
-        # Construir respuesta
-        bloques = []
-        movimientos_lista = []
-        
-        for codigo in ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']:
-            movimientos = movimientos_bloque.get(codigo, 0)
-            movimientos_lista.append(movimientos)
+            if 'G' in xl.sheet_names:
+                df_g = pd.read_excel(xl, 'G', header=None)
+                stats['gruas_disponibles'] = len(df_g) - 1  # Menos el header
             
-            bloques.append({
-                'bloque': codigo,
-                'movimientos_totales': movimientos,
-                'utilizacion_promedio': utilizacion_bloque.get(codigo, {}).get('utilizacion', 0),
-                'congestion_maxima': utilizacion_bloque.get(codigo, {}).get('congestion', 0),
-                'gruas_asignadas': gruas_bloque.get(codigo, 0),
-                'capacidad_total': capacidad_default
-            })
-        
-        # Calcular coeficiente de variación
-        if movimientos_lista:
-            media = np.mean(movimientos_lista)
-            desv = np.std(movimientos_lista)
-            cv = (desv / media * 100) if media > 0 else 0
-        else:
-            cv = 0
-        
-        return {
-            'instancia_id': instance_id,
-            'bloques': bloques,
-            'coeficiente_variacion': cv,
-            'balance_score': 100 - cv  # Score inverso al CV
-        }
+            # Cargar demanda
+            if 'DMEst' in xl.sheet_names:
+                df_dme = pd.read_excel(xl, 'DMEst')
+                demanda_e = df_dme['DMEst'].sum() if 'DMEst' in df_dme.columns else 0
+                stats['demanda_total'] += demanda_e
+            
+            if 'DMIst' in xl.sheet_names:
+                df_dmi = pd.read_excel(xl, 'DMIst')
+                demanda_i = df_dmi['DMIst'].sum() if 'DMIst' in df_dmi.columns else 0
+                stats['demanda_total'] += demanda_i
+            
+            logger.info(f"Instancia cargada: {stats}")
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error cargando instancia: {e}")
+            return stats
     
-    # Métodos privados de procesamiento
-    async def _create_instance(
-        self, 
-        db: AsyncSession, 
-        instance_create: InstanciaCamilaCreate
-    ) -> InstanciaCamila:
-        """Crea una nueva instancia"""
-        instancia = InstanciaCamila(**instance_create.model_dump())
-        db.add(instancia)
-        await db.commit()
-        await db.refresh(instancia)
-        return instancia
-    
-    async def _ensure_master_data(self, db: AsyncSession):
-        """Asegura que existan los datos maestros"""
-        # Verificar bloques
-        result = await db.execute(select(func.count(Bloque.id)))
-        if result.scalar() == 0:
-            await self._create_bloques(db)
-        
-        # Verificar grúas
-        result = await db.execute(select(func.count(Grua.id)))
-        if result.scalar() == 0:
-            await self._create_gruas(db)
-        
-        # Verificar configuraciones
-        result = await db.execute(select(func.count(ConfiguracionSistema.id)))
-        if result.scalar() == 0:
-            await self._create_default_configs(db)
-    
-    async def _create_bloques(self, db: AsyncSession):
-        """Crea los bloques por defecto"""
-        bloques_data = [
-            {'codigo': 'C1', 'grupo_movimiento': 1, 'bloques_adyacentes': ['C3'], 'capacidad_teus': 1820},
-            {'codigo': 'C2', 'grupo_movimiento': 2, 'bloques_adyacentes': ['C4'], 'capacidad_teus': 1820},
-            {'codigo': 'C3', 'grupo_movimiento': 1, 'bloques_adyacentes': ['C1', 'C6'], 'capacidad_teus': 1820},
-            {'codigo': 'C4', 'grupo_movimiento': 2, 'bloques_adyacentes': ['C2', 'C7'], 'capacidad_teus': 1820},
-            {'codigo': 'C5', 'grupo_movimiento': 3, 'bloques_adyacentes': ['C8'], 'capacidad_teus': 1820},
-            {'codigo': 'C6', 'grupo_movimiento': 1, 'bloques_adyacentes': ['C3'], 'capacidad_teus': 1820},
-            {'codigo': 'C7', 'grupo_movimiento': 2, 'bloques_adyacentes': ['C4'], 'capacidad_teus': 1820},
-            {'codigo': 'C8', 'grupo_movimiento': 3, 'bloques_adyacentes': ['C5', 'C9'], 'capacidad_teus': 1820},
-            {'codigo': 'C9', 'grupo_movimiento': 3, 'bloques_adyacentes': ['C8'], 'capacidad_teus': 1820}
-        ]
-        
-        for data in bloques_data:
-            bloque = Bloque(**data)
-            db.add(bloque)
-        
-        await db.commit()
-    
-    async def _create_gruas(self, db: AsyncSession):
-        """Crea las grúas por defecto"""
-        for i in range(1, 13):
-            grua = Grua(codigo=f'G{i}')
-            db.add(grua)
-        
-        await db.commit()
-    
-    async def _create_default_configs(self, db: AsyncSession):
-        """Crea configuraciones por defecto"""
-        configs = [
-            {'clave': 'capacidad_bloque_default', 'valor': '1820', 'tipo': 'int', 
-             'descripcion': 'Capacidad por defecto de un bloque en TEUs'},
-            {'clave': 'umbral_congestion_alta', 'valor': '150', 'tipo': 'int',
-             'descripcion': 'Umbral de movimientos para considerar congestión alta'},
-            {'clave': 'tiempo_espera_estimado', 'valor': '25', 'tipo': 'int',
-             'descripcion': 'Tiempo de espera estimado en minutos'},
-            {'clave': 'productividad_nominal', 'valor': '20', 'tipo': 'int',
-             'descripcion': 'Productividad nominal de grúas en mov/hora'},
-            {'clave': 'teus_por_bahia', 'valor': '35', 'tipo': 'int',
-             'descripcion': 'Capacidad en TEUs por bahía'},
-        ]
-        
-        for config_data in configs:
-            config = ConfiguracionSistema(**config_data)
-            db.add(config)
-        
-        await db.commit()
-    
-    async def _get_config_value(self, db: AsyncSession, clave: str, default: Any) -> Any:
-        """Obtiene valor de configuración"""
-        result = await db.execute(
-            select(ConfiguracionSistema)
-            .where(ConfiguracionSistema.clave == clave)
-        )
-        config = result.scalar_one_or_none()
-        
-        if not config:
-            return default
-        
-        # Convertir según tipo
-        if config.tipo == 'int':
-            return int(config.valor)
-        elif config.tipo == 'float':
-            return float(config.valor)
-        elif config.tipo == 'boolean':
-            return config.valor.lower() == 'true'
-        else:
-            return config.valor
-    
-    # Métodos para obtener datos de Magdalena desde BD
-    async def _get_inventarios_from_magdalena_db(
-        self, 
-        db: AsyncSession, 
-        magdalena_id: int, 
-        turno: int
+    async def _load_magdalena_info(
+        self, filepath: str, resultado_id: UUID, turno: int
     ) -> Dict[str, Any]:
-        """Obtiene inventarios desde BD de Magdalena"""
-        inventarios = {'exportacion': {}, 'importacion': {}}
+        """Carga información relevante de Magdalena para el turno específico"""
         
-        # CARGA (exportación lista para cargar)
-        result = await db.execute(
-            select(
-                MovimientoModelo.segregacion_id,
-                BloqueMagdalena.codigo.label('bloque'),
-                func.count(MovimientoModelo.id).label('cantidad')
-            )
-            .join(BloqueMagdalena, MovimientoModelo.bloque_origen_id == BloqueMagdalena.id)
-            .where(
-                and_(
-                    MovimientoModelo.instancia_id == magdalena_id,
-                    MovimientoModelo.periodo == turno,
-                    MovimientoModelo.tipo == 'LOAD'
-                )
-            )
-            .group_by(MovimientoModelo.segregacion_id, BloqueMagdalena.codigo)
-        )
+        logger.info(f"Cargando información de Magdalena para turno {turno}...")
         
-        for row in result:
-            seg = f"S{row.segregacion_id}"
-            if seg not in inventarios['exportacion']:
-                inventarios['exportacion'][seg] = {}
-            inventarios['exportacion'][seg][row.bloque] = row.cantidad
-        
-        # ENTREGA (importación lista para entregar)
-        result = await db.execute(
-            select(
-                MovimientoModelo.segregacion_id,
-                BloqueMagdalena.codigo.label('bloque'),
-                func.count(MovimientoModelo.id).label('cantidad')
-            )
-            .join(BloqueMagdalena, MovimientoModelo.bloque_origen_id == BloqueMagdalena.id)
-            .where(
-                and_(
-                    MovimientoModelo.instancia_id == magdalena_id,
-                    MovimientoModelo.periodo == turno,
-                    MovimientoModelo.tipo == 'DLVR'
-                )
-            )
-            .group_by(MovimientoModelo.segregacion_id, BloqueMagdalena.codigo)
-        )
-        
-        for row in result:
-            seg = f"S{row.segregacion_id}"
-            if seg not in inventarios['importacion']:
-                inventarios['importacion'][seg] = {}
-            inventarios['importacion'][seg][row.bloque] = row.cantidad
-        
-        return inventarios
-    
-    async def _get_capacidades_from_magdalena_db(
-        self, 
-        db: AsyncSession, 
-        magdalena_id: int, 
-        turno: int
-    ) -> Dict[str, Any]:
-        """Obtiene capacidades desde BD de Magdalena"""
-        capacidades = {}
-        
-        # Obtener ocupación por bloque
-        result = await db.execute(
-            select(
-                OcupacionBloque.bloque_id,
-                BloqueMagdalena.codigo,
-                OcupacionBloque.capacidad_total,
-                OcupacionBloque.ocupacion_promedio
-            )
-            .join(BloqueMagdalena)
-            .where(
-                and_(
-                    OcupacionBloque.instancia_id == magdalena_id,
-                    OcupacionBloque.periodo == turno
-                )
-            )
-        )
-        
-        # Por cada bloque, calcular capacidad por segregación
-        for row in result:
-            bloque_codigo = row.codigo
+        try:
+            xl = pd.ExcelFile(filepath)
+            stats = {
+                'movimientos_magdalena': 0,
+                'bloques_magdalena': set(),
+                'segregaciones_magdalena': set(),
+                'volumen_total': 0
+            }
             
-            # Obtener segregaciones en este bloque
-            seg_result = await db.execute(
-                select(
-                    MovimientoModelo.segregacion_id,
-                    func.count(func.distinct(MovimientoModelo.bahia_id)).label('bahias')
-                )
-                .where(
-                    and_(
-                        MovimientoModelo.instancia_id == magdalena_id,
-                        MovimientoModelo.bloque_destino_id == row.bloque_id,
-                        MovimientoModelo.periodo <= turno
-                    )
-                )
-                .group_by(MovimientoModelo.segregacion_id)
-            )
-            
-            if bloque_codigo not in capacidades:
-                capacidades[bloque_codigo] = {}
-            
-            teus_por_bahia = await self._get_config_value(db, 'teus_por_bahia', 35)
-            
-            for seg_row in seg_result:
-                seg = f"S{seg_row.segregacion_id}"
-                capacidades[bloque_codigo][seg] = seg_row.bahias * teus_por_bahia
-        
-        return capacidades
-    
-    # Métodos para procesar datos importados
-    async def _process_inventories_magdalena(
-        self, 
-        db: AsyncSession, 
-        instancia: InstanciaCamila,
-        inventarios: Dict[str, Any]
-    ):
-        """Procesa inventarios importados de Magdalena"""
-        bloques = await self._get_bloques_dict(db)
-        segregaciones = await self._get_segregaciones_dict(db)
-        
-        # Procesar exportación
-        for seg_code, bloques_data in inventarios.get('exportacion', {}).items():
-            if seg_code not in segregaciones:
-                continue
+            # Cargar hoja General
+            if 'General' in xl.sheet_names:
+                df_general = pd.read_excel(xl, 'General')
                 
-            for bloque_code, cantidad in bloques_data.items():
-                if bloque_code not in bloques:
-                    continue
+                # Filtrar por periodo (turno)
+                df_turno = df_general[df_general['Periodo'] == turno]
                 
-                inventario = InventarioInicial(
-                    instancia_id=instancia.id,
-                    bloque_id=bloques[bloque_code],
-                    segregacion_id=segregaciones[seg_code],
-                    contenedores_exportacion=cantidad,
-                    teus_exportacion=cantidad * 2,  # Ajustar según tipo
-                    fuente='magdalena'
-                )
-                db.add(inventario)
-        
-        # Procesar importación
-        for seg_code, bloques_data in inventarios.get('importacion', {}).items():
-            if seg_code not in segregaciones:
-                continue
-                
-            for bloque_code, cantidad in bloques_data.items():
-                if bloque_code not in bloques:
-                    continue
-                
-                # Buscar si ya existe
-                result = await db.execute(
-                    select(InventarioInicial)
-                    .where(
-                        and_(
-                            InventarioInicial.instancia_id == instancia.id,
-                            InventarioInicial.bloque_id == bloques[bloque_code],
-                            InventarioInicial.segregacion_id == segregaciones[seg_code]
-                        )
-                    )
-                )
-                inv = result.scalar_one_or_none()
-                
-                if inv:
-                    inv.contenedores_importacion = cantidad
-                    inv.teus_importacion = cantidad * 2
-                else:
-                    inventario = InventarioInicial(
-                        instancia_id=instancia.id,
-                        bloque_id=bloques[bloque_code],
-                        segregacion_id=segregaciones[seg_code],
-                        contenedores_importacion=cantidad,
-                        teus_importacion=cantidad * 2,
-                        fuente='magdalena'
-                    )
-                    db.add(inventario)
-        
-        await db.commit()
-    
-    async def _process_capacities_magdalena(
-        self, 
-        db: AsyncSession, 
-        instancia: InstanciaCamila,
-        capacidades: Dict[str, Any]
-    ):
-        """Procesa capacidades importadas de Magdalena"""
-        bloques = await self._get_bloques_dict(db)
-        segregaciones = await self._get_segregaciones_dict(db)
-        
-        for bloque_code, segs_data in capacidades.items():
-            if bloque_code not in bloques:
-                continue
-            
-            for seg_code, capacidad_teus in segs_data.items():
-                if seg_code not in segregaciones:
-                    continue
-                
-                # Obtener tipo de contenedor
-                result = await db.execute(
-                    select(Segregacion.tipo_contenedor)
-                    .where(Segregacion.id == segregaciones[seg_code])
-                )
-                tipo = result.scalar() or '40'
-                
-                # Calcular contenedores
-                factor = 1 if tipo == '20' else 2
-                capacidad_contenedores = capacidad_teus // factor
-                
-                cap = CapacidadBloque(
-                    instancia_id=instancia.id,
-                    bloque_id=bloques[bloque_code],
-                    segregacion_id=segregaciones[seg_code],
-                    capacidad_contenedores=capacidad_contenedores,
-                    capacidad_teus=capacidad_teus,
-                    bahias_asignadas=capacidad_teus // 35
-                )
-                db.add(cap)
-        
-        await db.commit()
-    
-    async def _process_demands_magdalena(
-        self, 
-        db: AsyncSession, 
-        instancia: InstanciaCamila,
-        demandas_hora: Dict[str, Any]
-    ):
-        """Procesa demandas por hora importadas de Magdalena"""
-        segregaciones = await self._get_segregaciones_dict(db)
-        
-        # Crear períodos primero
-        await self._process_periods(db, instancia)
-        
-        # Obtener períodos
-        result = await db.execute(
-            select(PeriodoHora)
-            .where(PeriodoHora.instancia_id == instancia.id)
-            .order_by(PeriodoHora.hora_relativa)
-        )
-        periodos = {p.hora_relativa: p.id for p in result.scalars()}
-        
-        # Procesar cada tipo de demanda
-        for tipo in ['carga', 'descarga', 'recepcion', 'entrega']:
-            demandas_tipo = demandas_hora.get(tipo, {})
-            
-            for seg_code, valores_hora in demandas_tipo.items():
-                if seg_code not in segregaciones:
-                    continue
-                
-                for i, cantidad in enumerate(valores_hora):
-                    hora = i + 1
-                    if hora not in periodos:
-                        continue
+                for idx, row in df_turno.iterrows():
+                    recepcion = int(row.get('Recepción', 0))
+                    carga = int(row.get('Carga', 0))
+                    descarga = int(row.get('Descarga', 0))
+                    entrega = int(row.get('Entrega', 0))
                     
-                    # Buscar si ya existe
-                    result = await db.execute(
-                        select(DemandaOperacion)
-                        .where(
-                            and_(
-                                DemandaOperacion.instancia_id == instancia.id,
-                                DemandaOperacion.segregacion_id == segregaciones[seg_code],
-                                DemandaOperacion.periodo_hora_id == periodos[hora]
-                            )
-                        )
-                    )
-                    dem = result.scalar_one_or_none()
-                    
-                    if not dem:
-                        dem = DemandaOperacion(
-                            instancia_id=instancia.id,
-                            segregacion_id=segregaciones[seg_code],
-                            periodo_hora_id=periodos[hora]
-                        )
-                        db.add(dem)
-                    
-                    setattr(dem, f'demanda_{tipo}', cantidad)
-        
-        await db.commit()
+                    total_mov = recepcion + carga + descarga + entrega
+                    if total_mov > 0:
+                        stats['movimientos_magdalena'] += total_mov
+                        stats['bloques_magdalena'].add(str(row.get('Bloque', '')))
+                        stats['segregaciones_magdalena'].add(str(row.get('Segregación', '')))
+                        stats['volumen_total'] += int(row.get('Volumen (TEUs)', 0))
+                
+                # Guardar resumen para comparación
+                stats['df_magdalena_turno'] = df_turno
+            
+            logger.info(f"Magdalena turno {turno}: {stats['movimientos_magdalena']} movimientos")
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error cargando Magdalena: {e}")
+            return {}
     
-    async def _save_magdalena_hourly_demands(
-        self,
-        db: AsyncSession,
-        instancia_id: int,
-        magdalena_instance_id: int,
-        demandas_hora: Dict[str, Any]
-    ):
-        """Guarda las demandas por hora de Magdalena en tabla específica"""
-        for tipo in ['carga', 'descarga', 'recepcion', 'entrega']:
-            demandas_tipo = demandas_hora.get(tipo, {})
-            
-            for seg_code, valores_hora in demandas_tipo.items():
-                for i, cantidad in enumerate(valores_hora):
-                    hora_turno = i + 1
-                    
-                    # Buscar si ya existe
-                    result = await db.execute(
-                        select(DemandaHoraMagdalena)
-                        .where(
-                            and_(
-                                DemandaHoraMagdalena.instancia_id == instancia_id,
-                                DemandaHoraMagdalena.segregacion == seg_code,
-                                DemandaHoraMagdalena.hora_turno == hora_turno
-                            )
-                        )
-                    )
-                    dem = result.scalar_one_or_none()
-                    
-                    if not dem:
-                        dem = DemandaHoraMagdalena(
-                            instancia_id=instancia_id,
-                            magdalena_instance_id=magdalena_instance_id,
-                            segregacion=seg_code,
-                            hora_turno=hora_turno
-                        )
-                        db.add(dem)
-                    
-                    # Actualizar según tipo
-                    if tipo == 'carga':
-                        dem.dc_carga = cantidad
-                    elif tipo == 'descarga':
-                        dem.dd_descarga = cantidad
-                    elif tipo == 'recepcion':
-                        dem.dr_recepcion = cantidad
-                    elif tipo == 'entrega':
-                        dem.de_entrega = cantidad
+    async def _calculate_truck_quotas(self, resultado_id: UUID, asignaciones: List[AsignacionGrua]):
+        """Calcula cuotas de camiones basadas en las asignaciones de grúas"""
         
-        await db.commit()
-    
-# Continuación de camila_service.py desde donde quedó...
-
-    async def _process_parameters(
-        self, 
-        db: AsyncSession, 
-        instancia: InstanciaCamila, 
-        params: Dict[str, Any]
-    ):
-        """Procesa parámetros generales"""
-        parametros = ParametroGeneral(
-            instancia_id=instancia.id,
-            **params
-        )
-        db.add(parametros)
-        await db.commit()
-    
-    async def _process_periods(self, db: AsyncSession, instancia: InstanciaCamila):
-        """Crea los períodos (horas) del turno"""
-        turno = instancia.turno
-        hora_base = (turno - 1) * 8
+        logger.info("Calculando cuotas de camiones...")
         
-        for hora_rel in range(1, 9):
-            hora_abs = hora_base + hora_rel
-            hora_inicio_int = ((hora_abs - 1) % 24)
-            
-            periodo = PeriodoHora(
-                instancia_id=instancia.id,
-                hora_relativa=hora_rel,
-                hora_absoluta=hora_abs,
-                hora_inicio=time(hora_inicio_int, 0),
-                hora_fin=time((hora_inicio_int + 1) % 24, 0),
-                dia_semana=((hora_abs - 1) // 24) + 1
-            )
-            db.add(periodo)
+        # Agrupar por periodo y bloque
+        cuotas_por_periodo = {}
         
-        await db.commit()
-    
-    async def _process_initial_inventory(
-        self, 
-        db: AsyncSession, 
-        instancia: InstanciaCamila,
-        data: Dict[str, Any]
-    ):
-        """Procesa inventarios iniciales"""
-        # Obtener IDs de bloques y segregaciones
-        bloques = await self._get_bloques_dict(db)
-        segregaciones = await self._get_segregaciones_dict(db, data['segregaciones'])
+        for asig in asignaciones:
+            key = (asig.periodo, asig.bloque_codigo)
+            if key not in cuotas_por_periodo:
+                cuotas_por_periodo[key] = {
+                    'frecuencia_total': 0,
+                    'segregaciones': set()
+                }
+            cuotas_por_periodo[key]['frecuencia_total'] += asig.frecuencia
+            cuotas_por_periodo[key]['segregaciones'].add(asig.segregacion_codigo)
         
-        # Procesar exportación
-        for seg_code, bloques_data in data['almacenados_exp'].items():
-            if seg_code not in segregaciones:
-                continue
-                
-            for bloque_code, cantidad in bloques_data.items():
-                if bloque_code not in bloques:
-                    continue
-                
-                inventario = InventarioInicial(
-                    instancia_id=instancia.id,
-                    bloque_id=bloques[bloque_code],
-                    segregacion_id=segregaciones[seg_code],
-                    contenedores_exportacion=cantidad,
-                    teus_exportacion=cantidad * 2  # Ajustar según tipo
-                )
-                db.add(inventario)
-        
-        # Procesar importación
-        for seg_code, bloques_data in data['almacenados_imp'].items():
-            if seg_code not in segregaciones:
-                continue
-                
-            for bloque_code, cantidad in bloques_data.items():
-                if bloque_code not in bloques:
-                    continue
-                
-                # Buscar si ya existe
-                result = await db.execute(
-                    select(InventarioInicial)
-                    .where(
-                        and_(
-                            InventarioInicial.instancia_id == instancia.id,
-                            InventarioInicial.bloque_id == bloques[bloque_code],
-                            InventarioInicial.segregacion_id == segregaciones[seg_code]
-                        )
-                    )
-                )
-                inv = result.scalar_one_or_none()
-                
-                if inv:
-                    inv.contenedores_importacion = cantidad
-                    inv.teus_importacion = cantidad * 2
-                else:
-                    inventario = InventarioInicial(
-                        instancia_id=instancia.id,
-                        bloque_id=bloques[bloque_code],
-                        segregacion_id=segregaciones[seg_code],
-                        contenedores_importacion=cantidad,
-                        teus_importacion=cantidad * 2
-                    )
-                    db.add(inventario)
-        
-        await db.commit()
-    
-    async def _process_demands(
-        self, 
-        db: AsyncSession, 
-        instancia: InstanciaCamila,
-        data: Dict[str, Any]
-    ):
-        """Procesa demandas operacionales"""
-        segregaciones = await self._get_segregaciones_dict(db, data['segregaciones'])
-        
-        # Obtener períodos
-        result = await db.execute(
-            select(PeriodoHora)
-            .where(PeriodoHora.instancia_id == instancia.id)
-            .order_by(PeriodoHora.hora_relativa)
-        )
-        periodos = {p.hora_relativa: p.id for p in result.scalars()}
-        
-        # Procesar cada tipo de demanda
-        for seg_code, horas_data in data['demanda_carga'].items():
-            if seg_code not in segregaciones:
-                continue
-            
-            for hora, cantidad in horas_data.items():
-                if hora not in periodos:
-                    continue
-                
-                demanda = DemandaOperacion(
-                    instancia_id=instancia.id,
-                    segregacion_id=segregaciones[seg_code],
-                    periodo_hora_id=periodos[hora],
-                    demanda_carga=cantidad
-                )
-                db.add(demanda)
-        
-        # Similar para descarga
-        for seg_code, horas_data in data['demanda_descarga'].items():
-            if seg_code not in segregaciones:
-                continue
-            
-            for hora, cantidad in horas_data.items():
-                if hora not in periodos:
-                    continue
-                
-                # Buscar si ya existe
-                result = await db.execute(
-                    select(DemandaOperacion)
-                    .where(
-                        and_(
-                            DemandaOperacion.instancia_id == instancia.id,
-                            DemandaOperacion.segregacion_id == segregaciones[seg_code],
-                            DemandaOperacion.periodo_hora_id == periodos[hora]
-                        )
-                    )
-                )
-                dem = result.scalar_one_or_none()
-                
-                if dem:
-                    dem.demanda_descarga = cantidad
-                else:
-                    demanda = DemandaOperacion(
-                        instancia_id=instancia.id,
-                        segregacion_id=segregaciones[seg_code],
-                        periodo_hora_id=periodos[hora],
-                        demanda_descarga=cantidad
-                    )
-                    db.add(demanda)
-        
-        # Procesar recepción gate (distribuir en 8 horas)
-        for seg_code, total in data['gate_recepcion'].items():
-            if seg_code not in segregaciones:
-                continue
-            
-            cantidad_por_hora = total // 8
-            resto = total % 8
-            
-            for hora in range(1, 9):
-                cantidad = cantidad_por_hora + (1 if hora <= resto else 0)
-                
-                if hora not in periodos:
-                    continue
-                
-                # Buscar si ya existe
-                result = await db.execute(
-                    select(DemandaOperacion)
-                    .where(
-                        and_(
-                            DemandaOperacion.instancia_id == instancia.id,
-                            DemandaOperacion.segregacion_id == segregaciones[seg_code],
-                            DemandaOperacion.periodo_hora_id == periodos[hora]
-                        )
-                    )
-                )
-                dem = result.scalar_one_or_none()
-                
-                if dem:
-                    dem.demanda_recepcion = cantidad
-                else:
-                    demanda = DemandaOperacion(
-                        instancia_id=instancia.id,
-                        segregacion_id=segregaciones[seg_code],
-                        periodo_hora_id=periodos[hora],
-                        demanda_recepcion=cantidad
-                    )
-                    db.add(demanda)
-        
-        await db.commit()
-    
-    async def _process_capacities(
-        self, 
-        db: AsyncSession, 
-        instancia: InstanciaCamila,
-        data: Dict[str, Any]
-    ):
-        """Procesa capacidades por bloque"""
-        bloques = await self._get_bloques_dict(db)
-        segregaciones = await self._get_segregaciones_dict(db, data['segregaciones'])
-        
-        for bloque_code, segs_data in data['capacidad_bloques'].items():
-            if bloque_code not in bloques:
-                continue
-            
-            for seg_code, capacidad in segs_data.items():
-                if seg_code not in segregaciones:
-                    continue
-                
-                cap = CapacidadBloque(
-                    instancia_id=instancia.id,
-                    bloque_id=bloques[bloque_code],
-                    segregacion_id=segregaciones[seg_code],
-                    capacidad_contenedores=capacidad,
-                    capacidad_teus=capacidad * 2,  # Ajustar según tipo
-                    bahias_asignadas=capacidad // 35  # 35 contenedores por bahía
-                )
-                db.add(cap)
-        
-        await db.commit()
-    
-    async def _process_crane_assignments(
-        self, 
-        db: AsyncSession, 
-        instancia: InstanciaCamila,
-        assignments: List[Dict[str, Any]]
-    ):
-        """Procesa asignaciones de grúas"""
-        bloques = await self._get_bloques_dict(db)
-        gruas = await self._get_gruas_dict(db)
-        
-        # Obtener períodos
-        result = await db.execute(
-            select(PeriodoHora)
-            .where(PeriodoHora.instancia_id == instancia.id)
-        )
-        periodos = {p.hora_relativa: p.id for p in result.scalars()}
-        
-        # Crear todas las combinaciones posibles primero
-        for grua_id in gruas.values():
-            for periodo_id in periodos.values():
-                for bloque_id in bloques.values():
-                    asig = AsignacionGrua(
-                        instancia_id=instancia.id,
-                        grua_id=grua_id,
-                        bloque_id=bloque_id,
-                        periodo_hora_id=periodo_id,
-                        asignada=False
-                    )
-                    db.add(asig)
-        
-        await db.commit()
-        
-        # Actualizar las asignadas
-        for asig_data in assignments:
-            if (asig_data['grua'] not in gruas or 
-                asig_data['bloque'] not in bloques or
-                asig_data['hora'] not in periodos):
-                continue
-            
-            result = await db.execute(
-                select(AsignacionGrua)
-                .where(
-                    and_(
-                        AsignacionGrua.instancia_id == instancia.id,
-                        AsignacionGrua.grua_id == gruas[asig_data['grua']],
-                        AsignacionGrua.periodo_hora_id == periodos[asig_data['hora']]
-                    )
-                )
-            )
-            
-            for asig in result.scalars():
-                if asig.bloque_id == bloques[asig_data['bloque']]:
-                    asig.asignada = True
-                    asig.productividad_real = asig_data.get('productividad', 20)
-                    asig.movimientos_realizados = asig_data.get('movimientos', 0)
-        
-        await db.commit()
-    
-    async def _process_flows(
-        self, 
-        db: AsyncSession, 
-        instancia: InstanciaCamila,
-        flows_data: Dict[str, Any]
-    ):
-        """Procesa flujos operacionales"""
-        bloques = await self._get_bloques_dict(db)
-        segregaciones = await self._get_segregaciones_dict(db)
-        
-        # Obtener períodos
-        result = await db.execute(
-            select(PeriodoHora)
-            .where(PeriodoHora.instancia_id == instancia.id)
-        )
-        periodos = {p.hora_relativa: p.id for p in result.scalars()}
-        
-        # Procesar cada tipo de flujo
-        for tipo in ['flujo_carga', 'flujo_descarga', 'flujo_recepcion', 'flujo_entrega']:
-            flujos = flows_data.get(tipo, {})
-            
-            for seg_code, bloques_data in flujos.items():
-                if seg_code not in segregaciones:
-                    continue
-                
-                for bloque_code, horas_data in bloques_data.items():
-                    if bloque_code not in bloques:
-                        continue
-                    
-                    for hora, cantidad in horas_data.items():
-                        if hora not in periodos:
-                            continue
-                        
-                        # Buscar si ya existe el flujo
-                        result = await db.execute(
-                            select(FlujoOperacional)
-                            .where(
-                                and_(
-                                    FlujoOperacional.instancia_id == instancia.id,
-                                    FlujoOperacional.segregacion_id == segregaciones[seg_code],
-                                    FlujoOperacional.bloque_id == bloques[bloque_code],
-                                    FlujoOperacional.periodo_hora_id == periodos[hora]
-                                )
-                            )
-                        )
-                        flujo = result.scalar_one_or_none()
-                        
-                        if not flujo:
-                            flujo = FlujoOperacional(
-                                instancia_id=instancia.id,
-                                segregacion_id=segregaciones[seg_code],
-                                bloque_id=bloques[bloque_code],
-                                periodo_hora_id=periodos[hora]
-                            )
-                            db.add(flujo)
-                        
-                        # Actualizar el tipo específico
-                        setattr(flujo, tipo, cantidad)
-        
-        await db.commit()
-    
-    async def _process_availability(
-        self, 
-        db: AsyncSession, 
-        instancia: InstanciaCamila,
-        data: Dict[str, Any]
-    ):
-        """Procesa disponibilidad por bloque"""
-        bloques = await self._get_bloques_dict(db)
-        
-        # Obtener períodos
-        result = await db.execute(
-            select(PeriodoHora)
-            .where(PeriodoHora.instancia_id == instancia.id)
-        )
-        periodos = {p.hora_relativa: p.id for p in result.scalars()}
-        
-        # Capacidad por bloque y hora
-        capacidades = data.get('capacidad_bloques', {})
-        disponibilidades = data.get('disponibilidad', {})
-        
-        for bloque_code, horas_data in disponibilidades.items():
-            if bloque_code not in bloques:
-                continue
-            
-            for hora, disponible in horas_data.items():
-                if hora not in periodos:
-                    continue
-                
-                capacidad_total = capacidades.get(bloque_code, {}).get(hora, 0)
-                utilizada = capacidad_total - disponible
-                
-                disp = DisponibilidadBloque(
-                    instancia_id=instancia.id,
-                    bloque_id=bloques[bloque_code],
-                    periodo_hora_id=periodos[hora],
-                    movimientos_disponibles=disponible,
-                    capacidad_total=capacidad_total,
-                    capacidad_utilizada=utilizada,
-                    capacidad_libre=disponible,
-                    utilizacion_pct=(utilizada / capacidad_total * 100) if capacidad_total > 0 else 0,
-                    congestion_index=(utilizada / capacidad_total) if capacidad_total > 0 else 0
-                )
-                db.add(disp)
-        
-        await db.commit()
-    
-    async def _process_quotas(
-        self, 
-        db: AsyncSession, 
-        instancia: InstanciaCamila,
-        quotas_data: List[Dict[str, Any]]
-    ):
-        """Procesa cuotas de camiones"""
-        # Obtener períodos
-        result = await db.execute(
-            select(PeriodoHora)
-            .where(PeriodoHora.instancia_id == instancia.id)
-        )
-        periodos = {p.hora_relativa: p.id for p in result.scalars()}
-        
-        for quota_data in quotas_data:
-            hora = quota_data['hora']
-            if hora not in periodos:
-                continue
+        # Crear cuotas
+        batch_cuotas = []
+        for (periodo, bloque), data in cuotas_por_periodo.items():
+            # Asumiendo productividad de 30 mov/hora y ventana de 2 horas
+            capacidad_periodo = 30 * 2  # 60 movimientos por ventana
             
             cuota = CuotaCamion(
-                instancia_id=instancia.id,
-                periodo_hora_id=periodos[hora],
-                cuota_recepcion=quota_data['cuota_recepcion'],
-                cuota_entrega=quota_data['cuota_entrega'],
-                cuota_total=quota_data['cuota_total'],
-                capacidad_disponible=quota_data.get('capacidad_disponible', 0),
-                utilizacion_esperada=quota_data.get('utilizacion_esperada', 0)
+                resultado_id=resultado_id,
+                periodo=periodo,
+                bloque_codigo=bloque,
+                ventana_inicio=periodo,
+                ventana_fin=periodo,
+                cuota_camiones=min(data['frecuencia_total'], capacidad_periodo),
+                capacidad_maxima=capacidad_periodo,
+                tipo_operacion='mixto',
+                segregaciones_incluidas=list(data['segregaciones'])
             )
-            db.add(cuota)
+            batch_cuotas.append(cuota)
         
-        await db.commit()
+        if batch_cuotas:
+            self.db.add_all(batch_cuotas)
+            await self.db.flush()
+        
+        logger.info(f"✓ Calculadas {len(batch_cuotas)} cuotas de camiones")
     
     async def _calculate_metrics(
-        self, 
-        db: AsyncSession, 
-        instancia: InstanciaCamila,
-        metrics_data: Dict[str, float]
+        self, resultado_id: UUID, stats_resultado: Dict, stats_magdalena: Dict
     ):
-        """Calcula y guarda métricas"""
-        # Obtener datos para cálculos adicionales
+        """Calcula métricas de desempeño"""
         
-        # 1. Grúas utilizadas y cambios
-        gruas_stats = await self._calculate_crane_stats(db, instancia.id)
+        logger.info("Calculando métricas de Camila...")
         
-        # 2. Flujos totales y cumplimiento
-        flujos_stats = await self._calculate_flow_stats(db, instancia.id)
-        
-        # 3. Balance y congestión
-        balance_stats = await self._calculate_balance_stats(db, instancia.id)
-        
-        # 4. Cuotas
-        cuotas_stats = await self._calculate_quota_stats(db, instancia.id)
-        
-        # Crear registro de métricas
-        metricas = MetricaResultado(
-            instancia_id=instancia.id,
-            valor_funcion_objetivo=metrics_data.get('funcion_objetivo', 0),
-            gap_optimalidad=metrics_data.get('gap', 0),
-            
-            # Balance
-            desviacion_estandar_carga=balance_stats['desviacion'],
-            coeficiente_variacion=balance_stats['cv'],
-            indice_balance=100 - balance_stats['cv'],
-            
-            # Grúas
-            gruas_utilizadas_promedio=gruas_stats['promedio_activas'],
-            utilizacion_gruas_pct=gruas_stats['utilizacion'],
-            cambios_bloque_total=gruas_stats['cambios_totales'],
-            cambios_por_grua_promedio=gruas_stats['cambios_promedio'],
-            productividad_promedio=gruas_stats['productividad'],
-            
-            # Flujos
-            movimientos_totales=flujos_stats['total'],
-            cumplimiento_carga_pct=flujos_stats['cumplimiento_carga'],
-            cumplimiento_descarga_pct=flujos_stats['cumplimiento_descarga'],
-            cumplimiento_recepcion_pct=flujos_stats['cumplimiento_recepcion'],
-            cumplimiento_entrega_pct=flujos_stats['cumplimiento_entrega'],
-            
-            # Congestión
-            congestion_maxima=balance_stats['congestion_maxima'],
-            bloque_mas_congestionado=balance_stats['bloque_congestionado'],
-            hora_pico=balance_stats['hora_pico'],
-            
-            # Camiones
-            cuota_total_turno=cuotas_stats['total'],
-            cuota_promedio_hora=cuotas_stats['promedio'],
-            uniformidad_cuotas=cuotas_stats['uniformidad']
+        # Obtener asignaciones
+        asig_result = await self.db.execute(
+            select(AsignacionGrua).where(AsignacionGrua.resultado_id == resultado_id)
         )
+        asignaciones = asig_result.scalars().all()
         
-        db.add(metricas)
+        if not asignaciones:
+            logger.warning("No hay asignaciones para calcular métricas")
+            return
         
-        # Calcular productividad por grúa
-        await self._calculate_crane_productivity(db, instancia.id)
+        # Métricas por grúa (asumiendo distribución equitativa entre 12 grúas)
+        num_gruas = 12
+        bloques_visitados = len(stats_resultado.get('bloques_visitados', set()))
         
-        await db.commit()
-    
-    # Métodos auxiliares
-    async def _get_bloques_dict(self, db: AsyncSession) -> Dict[str, int]:
-        """Obtiene diccionario codigo -> id de bloques"""
-        result = await db.execute(select(Bloque))
-        return {b.codigo: b.id for b in result.scalars()}
-    
-    async def _get_segregaciones_dict(
-        self, 
-        db: AsyncSession, 
-        segregaciones_data: List[Dict[str, Any]] = None
-    ) -> Dict[str, int]:
-        """Obtiene o crea segregaciones y retorna diccionario codigo -> id"""
-        # Si hay datos nuevos, crear segregaciones
-        if segregaciones_data:
-            for seg_data in segregaciones_data:
-                # Verificar si existe
-                result = await db.execute(
-                    select(Segregacion)
-                    .where(Segregacion.codigo == seg_data['codigo'])
-                )
-                seg = result.scalar_one_or_none()
-                
-                if not seg:
-                    seg = Segregacion(
-                        codigo=seg_data['codigo'],
-                        tipo_contenedor=seg_data.get('tipo_contenedor', '40'),
-                        descripcion=seg_data.get('descripcion', ''),
-                        categoria='general'
-                    )
-                    db.add(seg)
-            
-            await db.commit()
+        # Calcular utilización
+        movimientos_totales = stats_magdalena.get('movimientos_magdalena', 0)
+        capacidad_turno = num_gruas * 30 * 8  # 12 grúas * 30 mov/h * 8 horas
+        utilizacion = (movimientos_totales / capacidad_turno * 100) if capacidad_turno > 0 else 0
         
-        # Retornar diccionario
-        result = await db.execute(select(Segregacion))
-        return {s.codigo: s.id for s in result.scalars()}
-    
-    async def _get_gruas_dict(self, db: AsyncSession) -> Dict[str, int]:
-        """Obtiene diccionario codigo -> id de grúas"""
-        result = await db.execute(select(Grua))
-        return {g.codigo: g.id for g in result.scalars()}
-    
-    async def _import_segregaciones(self, db: AsyncSession, segregaciones_data: List[Dict[str, Any]]):
-        """Importa segregaciones desde Magdalena"""
-        for seg_data in segregaciones_data:
-            # Verificar si existe
-            result = await db.execute(
-                select(Segregacion)
-                .where(Segregacion.codigo == seg_data['codigo'])
-            )
-            seg = result.scalar_one_or_none()
-            
-            if not seg:
-                seg = Segregacion(
-                    codigo=seg_data['codigo'],
-                    tipo_contenedor=seg_data['tipo_contenedor'],
-                    descripcion=seg_data.get('descripcion', ''),
-                    categoria='general'
-                )
-                db.add(seg)
+        # Balance de trabajo (distribución entre bloques)
+        movimientos_por_bloque = {}
+        for asig in asignaciones:
+            if asig.bloque_codigo not in movimientos_por_bloque:
+                movimientos_por_bloque[asig.bloque_codigo] = 0
+            movimientos_por_bloque[asig.bloque_codigo] += asig.frecuencia
         
-        await db.commit()
-    
-    async def _calculate_crane_stats(self, db: AsyncSession, instance_id: int) -> Dict[str, Any]:
-        """Calcula estadísticas de grúas"""
-        # Grúas activas por hora
-        result = await db.execute(
-            select(
-                PeriodoHora.hora_relativa,
-                func.count(AsignacionGrua.id).label('gruas_activas')
-            )
-            .join(AsignacionGrua)
-            .where(
-                and_(
-                    AsignacionGrua.instancia_id == instance_id,
-                    AsignacionGrua.asignada == True
-                )
-            )
-            .group_by(PeriodoHora.hora_relativa)
-        )
-        
-        gruas_por_hora = [row.gruas_activas for row in result]
-        promedio_activas = np.mean(gruas_por_hora) if gruas_por_hora else 0
-        
-        # Cambios de bloque
-        cambios = await self._calculate_block_changes(db, instance_id)
-        cambios_totales = sum(cambios.values())
-        cambios_promedio = cambios_totales / 12  # 12 grúas
-        
-        # Productividad
-        result = await db.execute(
-            select(func.avg(AsignacionGrua.productividad_real))
-            .where(
-                and_(
-                    AsignacionGrua.instancia_id == instance_id,
-                    AsignacionGrua.asignada == True,
-                    AsignacionGrua.productividad_real.is_not(None)
-                )
-            )
-        )
-        productividad = result.scalar() or 18
-        
-        return {
-            'promedio_activas': promedio_activas,
-            'utilizacion': (promedio_activas / 12) * 100,
-            'cambios_totales': cambios_totales,
-            'cambios_promedio': cambios_promedio,
-            'productividad': productividad
-        }
-    
-    async def _calculate_flow_stats(self, db: AsyncSession, instance_id: int) -> Dict[str, Any]:
-        """Calcula estadísticas de flujos"""
-        # Totales por tipo
-        result = await db.execute(
-            select(
-                func.sum(FlujoOperacional.flujo_carga).label('carga'),
-                func.sum(FlujoOperacional.flujo_descarga).label('descarga'),
-                func.sum(FlujoOperacional.flujo_recepcion).label('recepcion'),
-                func.sum(FlujoOperacional.flujo_entrega).label('entrega')
-            )
-            .where(FlujoOperacional.instancia_id == instance_id)
-        )
-        
-        flujos = result.first()
-        total = (flujos.carga or 0) + (flujos.descarga or 0) + \
-                (flujos.recepcion or 0) + (flujos.entrega or 0)
-        
-        # Demandas totales
-        result = await db.execute(
-            select(
-                func.sum(DemandaOperacion.demanda_carga).label('carga'),
-                func.sum(DemandaOperacion.demanda_descarga).label('descarga'),
-                func.sum(DemandaOperacion.demanda_recepcion).label('recepcion'),
-                func.sum(DemandaOperacion.demanda_entrega).label('entrega')
-            )
-            .where(DemandaOperacion.instancia_id == instance_id)
-        )
-        
-        demandas = result.first()
-        
-        # Calcular cumplimiento
-        cumplimiento_carga = (flujos.carga / demandas.carga * 100) if demandas.carga else 100
-        cumplimiento_descarga = (flujos.descarga / demandas.descarga * 100) if demandas.descarga else 100
-        cumplimiento_recepcion = (flujos.recepcion / demandas.recepcion * 100) if demandas.recepcion else 100
-        cumplimiento_entrega = (flujos.entrega / demandas.entrega * 100) if demandas.entrega else 100
-        
-        return {
-            'total': total,
-            'cumplimiento_carga': min(cumplimiento_carga, 100),
-            'cumplimiento_descarga': min(cumplimiento_descarga, 100),
-            'cumplimiento_recepcion': min(cumplimiento_recepcion, 100),
-            'cumplimiento_entrega': min(cumplimiento_entrega, 100)
-        }
-    
-    async def _calculate_balance_stats(self, db: AsyncSession, instance_id: int) -> Dict[str, Any]:
-        """Calcula estadísticas de balance"""
-        # Movimientos por bloque
-        result = await db.execute(
-            select(
-                Bloque.codigo,
-                func.sum(
-                    FlujoOperacional.flujo_carga + 
-                    FlujoOperacional.flujo_descarga +
-                    FlujoOperacional.flujo_recepcion + 
-                    FlujoOperacional.flujo_entrega
-                ).label('total')
-            )
-            .join(Bloque)
-            .where(FlujoOperacional.instancia_id == instance_id)
-            .group_by(Bloque.codigo)
-        )
-        
-        movimientos = [row.total or 0 for row in result]
-        
-        if movimientos:
-            media = np.mean(movimientos)
-            desviacion = np.std(movimientos)
-            cv = (desviacion / media * 100) if media > 0 else 0
+        if movimientos_por_bloque:
+            valores = list(movimientos_por_bloque.values())
+            promedio = np.mean(valores)
+            desviacion = np.std(valores)
+            cv = (desviacion / promedio * 100) if promedio > 0 else 0
         else:
-            desviacion = 0
             cv = 0
         
-        # Congestión máxima
-        result = await db.execute(
-            select(
-                DisponibilidadBloque.congestion_index,
-                Bloque.codigo,
-                PeriodoHora.hora_relativa
+        # Crear métricas agregadas
+        for i in range(1, num_gruas + 1):
+            metrica = MetricaGrua(
+                resultado_id=resultado_id,
+                grua_id=i,
+                movimientos_asignados=movimientos_totales // num_gruas,
+                bloques_visitados=bloques_visitados,
+                tiempo_productivo_hrs=8 * (utilizacion / 100),
+                tiempo_improductivo_hrs=8 * (1 - utilizacion / 100),
+                utilizacion_pct=utilizacion,
+                distancia_recorrida_m=0  # Calcular si tenemos datos
             )
-            .join(Bloque)
-            .join(PeriodoHora)
-            .where(DisponibilidadBloque.instancia_id == instance_id)
-            .order_by(DisponibilidadBloque.congestion_index.desc())
-            .limit(1)
-        )
+            self.db.add(metrica)
         
-        congestion_row = result.first()
+        # Guardar métricas generales en el resultado
+        resultado = await self.db.get(ResultadoCamila, resultado_id)
+        resultado.total_gruas = num_gruas
+        resultado.total_movimientos = movimientos_totales
+        resultado.utilizacion_promedio = utilizacion
+        resultado.coeficiente_variacion = cv
         
-        return {
-            'desviacion': desviacion,
-            'cv': cv,
-            'congestion_maxima': congestion_row.congestion_index if congestion_row else 0,
-            'bloque_congestionado': congestion_row.codigo if congestion_row else 'N/A',
-            'hora_pico': congestion_row.hora_relativa if congestion_row else 0
-        }
+        await self.db.flush()
+        logger.info(f"✓ Métricas calculadas: Utilización {utilizacion:.1f}%, CV {cv:.1f}%")
     
-    async def _calculate_quota_stats(self, db: AsyncSession, instance_id: int) -> Dict[str, Any]:
-        """Calcula estadísticas de cuotas"""
-        result = await db.execute(
-            select(
-                func.sum(CuotaCamion.cuota_total).label('total'),
-                func.avg(CuotaCamion.cuota_total).label('promedio')
-            )
-            .where(CuotaCamion.instancia_id == instance_id)
+    async def _calculate_comparisons(self, resultado_id: UUID, stats_magdalena: Dict):
+        """Calcula comparaciones con Magdalena"""
+        
+        logger.info("Calculando comparaciones con Magdalena...")
+        
+        if 'df_magdalena_turno' not in stats_magdalena:
+            logger.warning("No hay datos de Magdalena para comparar")
+            return
+        
+        df_magdalena = stats_magdalena['df_magdalena_turno']
+        
+        # Obtener asignaciones de Camila
+        asig_result = await self.db.execute(
+            select(AsignacionGrua).where(AsignacionGrua.resultado_id == resultado_id)
         )
+        asignaciones = asig_result.scalars().all()
         
-        row = result.first()
-        total = row.total or 0
-        promedio = row.promedio or 0
+        # Crear diccionario de asignaciones Camila
+        camila_por_bloque = {}
+        for asig in asignaciones:
+            if asig.bloque_codigo not in camila_por_bloque:
+                camila_por_bloque[asig.bloque_codigo] = 0
+            camila_por_bloque[asig.bloque_codigo] += asig.frecuencia
         
-        # Uniformidad
-        result = await db.execute(
-            select(CuotaCamion.cuota_total)
-            .where(CuotaCamion.instancia_id == instance_id)
+        # Crear diccionario de movimientos Magdalena
+        magdalena_por_bloque = {}
+        for idx, row in df_magdalena.iterrows():
+            bloque = str(row.get('Bloque', ''))
+            total_mov = sum([
+                int(row.get('Recepción', 0)),
+                int(row.get('Carga', 0)),
+                int(row.get('Descarga', 0)),
+                int(row.get('Entrega', 0))
+            ])
+            if bloque not in magdalena_por_bloque:
+                magdalena_por_bloque[bloque] = 0
+            magdalena_por_bloque[bloque] += total_mov
+        
+        # Crear comparaciones
+        batch_comparaciones = []
+        
+        # Comparación general
+        total_magdalena = sum(magdalena_por_bloque.values())
+        total_camila = sum(camila_por_bloque.values())
+        
+        comp_general = ComparacionCamila(
+            resultado_id=resultado_id,
+            tipo_comparacion='general',
+            metrica='movimientos_totales',
+            valor_magdalena=float(total_magdalena),
+            valor_camila=float(total_camila),
+            diferencia=float(total_camila - total_magdalena),
+            porcentaje_diferencia=((total_camila - total_magdalena) / total_magdalena * 100) if total_magdalena > 0 else 0,
+            descripcion='Comparación de movimientos totales del turno'
         )
+        batch_comparaciones.append(comp_general)
         
-        cuotas = [row[0] for row in result]
+        # Comparación por bloque
+        todos_bloques = set(list(magdalena_por_bloque.keys()) + list(camila_por_bloque.keys()))
         
-        if cuotas and promedio > 0:
-            desv = np.std(cuotas)
-            uniformidad = 1 - (desv / promedio)
-        else:
-            uniformidad = 0
-        
-        return {
-            'total': total,
-            'promedio': promedio,
-            'uniformidad': uniformidad
-        }
-    
-    async def _calculate_block_changes(self, db: AsyncSession, instance_id: int) -> Dict[str, int]:
-        """Calcula cambios de bloque por grúa"""
-        result = await db.execute(
-            select(
-                Grua.codigo,
-                AsignacionGrua.bloque_id,
-                PeriodoHora.hora_relativa
-            )
-            .join(Grua)
-            .join(PeriodoHora)
-            .where(
-                and_(
-                    AsignacionGrua.instancia_id == instance_id,
-                    AsignacionGrua.asignada == True
-                )
-            )
-            .order_by(Grua.codigo, PeriodoHora.hora_relativa)
-        )
-        
-        cambios = {}
-        grua_actual = None
-        bloque_anterior = None
-        
-        for row in result:
-            if row.codigo != grua_actual:
-                grua_actual = row.codigo
-                bloque_anterior = row.bloque_id
-                cambios[grua_actual] = 0
-            elif row.bloque_id != bloque_anterior:
-                cambios[grua_actual] += 1
-                bloque_anterior = row.bloque_id
-        
-        return cambios
-    
-    async def _calculate_crane_productivity(self, db: AsyncSession, instance_id: int):
-        """Calcula productividad por grúa"""
-        # Obtener movimientos por grúa
-        result = await db.execute(
-            select(
-                AsignacionGrua.grua_id,
-                func.count(AsignacionGrua.id).label('horas'),
-                func.sum(AsignacionGrua.movimientos_realizados).label('movimientos')
-            )
-            .where(
-                and_(
-                    AsignacionGrua.instancia_id == instance_id,
-                    AsignacionGrua.asignada == True
-                )
-            )
-            .group_by(AsignacionGrua.grua_id)
-        )
-        
-        for row in result:
-            productividad = (row.movimientos / row.horas) if row.horas > 0 else 0
-            eficiencia = (productividad / 20) * 100  # 20 es nominal
+        for bloque in todos_bloques:
+            val_magdalena = magdalena_por_bloque.get(bloque, 0)
+            val_camila = camila_por_bloque.get(bloque, 0)
             
-            prod = ProductividadGrua(
-                instancia_id=instance_id,
-                grua_id=row.grua_id,
-                horas_trabajadas=row.horas,
-                movimientos_totales=row.movimientos or 0,
-                productividad_real=productividad,
-                eficiencia_pct=eficiencia
+            comp_bloque = ComparacionCamila(
+                resultado_id=resultado_id,
+                tipo_comparacion='por_bloque',
+                metrica=f'movimientos_{bloque}',
+                valor_magdalena=float(val_magdalena),
+                valor_camila=float(val_camila),
+                diferencia=float(val_camila - val_magdalena),
+                porcentaje_diferencia=((val_camila - val_magdalena) / val_magdalena * 100) if val_magdalena > 0 else 0,
+                descripcion=f'Movimientos en bloque {bloque}'
             )
-            db.add(prod)
+            batch_comparaciones.append(comp_bloque)
         
-        await db.commit()
+        # Balance de carga
+        cv_magdalena = np.std(list(magdalena_por_bloque.values())) / np.mean(list(magdalena_por_bloque.values())) * 100 if magdalena_por_bloque else 0
+        cv_camila = np.std(list(camila_por_bloque.values())) / np.mean(list(camila_por_bloque.values())) * 100 if camila_por_bloque else 0
+        
+        comp_balance = ComparacionCamila(
+            resultado_id=resultado_id,
+            tipo_comparacion='balance',
+            metrica='coeficiente_variacion',
+            valor_magdalena=cv_magdalena,
+            valor_camila=cv_camila,
+            diferencia=cv_camila - cv_magdalena,
+            porcentaje_diferencia=((cv_camila - cv_magdalena) / cv_magdalena * 100) if cv_magdalena > 0 else 0,
+            descripcion='Balance de carga entre bloques (CV%)'
+        )
+        batch_comparaciones.append(comp_balance)
+        
+        if batch_comparaciones:
+            self.db.add_all(batch_comparaciones)
+            await self.db.flush()
+        
+        logger.info(f"✓ Creadas {len(batch_comparaciones)} comparaciones")
+    
+    def _log_summary(self, resultado_id: UUID, stats_resultado: Dict, 
+                     stats_instancia: Dict, stats_magdalena: Dict):
+        """Log resumen de la carga"""
+        
+        logger.info("="*80)
+        logger.info("📊 RESUMEN DE CARGA DE CAMILA")
+        logger.info("="*80)
+        logger.info(f"Resultado ID: {resultado_id}")
+        
+        logger.info("\n📋 Datos cargados:")
+        logger.info(f"  - Asignaciones: {stats_resultado.get('total_asignaciones', 0)}")
+        logger.info(f"  - Bloques visitados: {len(stats_resultado.get('bloques_visitados', set()))}")
+        logger.info(f"  - Segregaciones: {len(stats_resultado.get('segregaciones_atendidas', set()))}")
+        logger.info(f"  - Períodos activos: {len(stats_resultado.get('periodos_activos', set()))}")
+        
+        if stats_magdalena:
+            logger.info("\n🔗 Integración con Magdalena:")
+            logger.info(f"  - Movimientos Magdalena: {stats_magdalena.get('movimientos_magdalena', 0)}")
+            logger.info(f"  - Volumen total: {stats_magdalena.get('volumen_total', 0)} TEUs")
+        
+        logger.info("="*80)
