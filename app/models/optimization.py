@@ -293,5 +293,5 @@ class LogProcesamiento(Base):
     
     __table_args__ = (
         Index('idx_log_instancia', 'instancia_id'),  # CAMBIADO
-        Index('idx_log_fecha', 'fecha_procesamiento'),  # CAMBIADO
+        Index('idx_log_magdalena_fecha', 'fecha_procesamiento'),  # CAMBIADO
     )

@@ -61,13 +61,9 @@ except Exception as e:
 
 try:
     from app.models.camila import (
-        ResultadoCamila,
-        AsignacionGrua,
-        CuotaCamion,
-        MetricaGrua,
-        ComparacionCamila,
-        ParametroCamila,
-        LogCamila
+        ResultadoCamila, AsignacionGrua, CuotaCamion, MetricaGrua,
+        ComparacionReal, FlujoModelo, ParametroCamila, LogProcesamientoCamila,
+        EstadoProcesamiento, TipoOperacion, TipoAsignacion
     )
     print('  ✓ Modelos de Camila importados')
 except Exception as e:
@@ -266,8 +262,8 @@ if [ "$SAI_COUNT" -eq "0" ]; then
         # Verificar si hay archivos de flujos
         if find /app/data/magdalena/2022/instancias_magdalena -name "Flujos_w*.xlsx" -type f | grep -q .; then
             echo "📁 Archivos de SAI encontrados, cargando..."
-            #python /app/scripts/load_sai_data.py
-            python /app/scripts/load_magdalena_data.py
+            # python /app/scripts/load_sai_data.py
+            # python /app/scripts/load_magdalena_data.py
             echo "✅ Datos de SAI cargados!"
         else
             echo "⚠️  No se encontraron archivos de SAI"
@@ -424,7 +420,7 @@ if [ "$LOAD_ALL" = true ]; then
     if [ "$FILES_FOUND" = true ]; then
         echo ""
         echo "🚀 Iniciando carga de datos..."
-         python scripts/load_historical_data.py --all
+        # python scripts/load_historical_data.py --all
         echo "✅ Proceso de carga completado!"
     else
         echo ""
@@ -452,7 +448,7 @@ if [ "$CONTAINER_POS_COUNT" -eq "0" ]; then
         
         if [ "$CSV_COUNT" -gt "0" ]; then
             echo "🚀 Iniciando carga de posiciones de contenedores..."
-            python /app/scripts/load_container_positions.py --year 2022
+            # python /app/scripts/load_container_positions.py 
             echo "✅ Datos de posiciones cargados!"
         else
             echo "⚠️  No se encontraron archivos CSV en data/2022/"

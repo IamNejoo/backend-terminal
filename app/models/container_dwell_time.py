@@ -1,5 +1,5 @@
 # app/models/container_dwell_time.py
-from sqlalchemy import Column, String, Integer,Boolean, Float, DateTime, Boolean, Index, UniqueConstraint
+from sqlalchemy import Column, String, Integer, Float, DateTime, Boolean, Index, UniqueConstraint
 from app.models.base import BaseModel
 class ContainerDwellTime(BaseModel):
     """
