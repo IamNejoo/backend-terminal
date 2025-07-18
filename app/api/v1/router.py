@@ -26,12 +26,7 @@ api_router.include_router(
 api_router.include_router(
     sai_flujos.router,
     prefix="/sai",
-    tags=["sai-flujos"]
+    tags=["sai", "historical"]
 )
 
 
-api_router.include_router(
-    container_positions.router,
-    prefix="/container-positions",
-    tags=["container-positions"]
-)

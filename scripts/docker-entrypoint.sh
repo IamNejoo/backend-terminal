@@ -1,5 +1,5 @@
 #!/bin/bash
-# scripts/docker-entrypoint.sh
+# scripts/docker-entrypoint.sh - Script completo con todas las tablas
 
 set -e
 
@@ -12,7 +12,6 @@ while ! pg_isready -h $POSTGRES_SERVER -p $POSTGRES_PORT -U $POSTGRES_USER; do
 done
 echo "✅ PostgreSQL está listo!"
 
-
 # Ejecutar migraciones/crear tablas - IMPORTAR TODOS LOS MODELOS PRIMERO
 echo "🔨 Creando tablas en la base de datos..."
 python -c "
@@ -24,12 +23,33 @@ from app.models.base import Base
 # Importar TODOS los modelos para que se registren con Base
 print('📦 Importando modelos...')
 
+# Modelos base
 try:
     from app.models.historical_movements import HistoricalMovement
     print('  ✓ Historical movements importado')
 except Exception as e:
     print(f'  ✗ Error importando historical_movements: {e}')
 
+try:
+    from app.models.movement_flow import MovementFlow
+    print('  ✓ Movement Flow importado')
+except Exception as e:
+    print(f'  ✗ Error importando movement_flow: {e}')
+
+try:
+    from app.models.container_position import ContainerPosition
+    print('  ✓ Container Position importado')
+except Exception as e:
+    print(f'  ✗ Error importando container_position: {e}')
+
+try:
+    from app.models.container_dwell_time import ContainerDwellTime
+    from app.models.truck_turnaround_time import TruckTurnaroundTime
+    print('  ✓ CDT y TTT importados')
+except Exception as e:
+    print(f'  ✗ Error importando CDT/TTT: {e}')
+
+# Modelos SAI
 try:
     from app.models.sai_flujos import (
         SAIConfiguration, SAIFlujo, SAIVolumenBloque, SAIVolumenSegregacion,
@@ -39,48 +59,37 @@ try:
 except Exception as e:
     print(f'  ✗ Error importando sai_flujos: {e}')
 
+# Modelos de Magdalena (Optimization)
 try:
     from app.models.optimization import (
-            Instancia,
-            Bloque,
-            Segregacion,
-            MovimientoReal,
-            MovimientoModelo,
-            DistanciaReal,
-            ResultadoGeneral,
-            AsignacionBloque,
-            CargaTrabajo,
-            OcupacionBloque,
-            KPIComparativo,
-            MetricaTemporal,
-            LogProcesamiento
-        )
-    print('  ✓ Modelos de Magdalena importados')
+        Instancia,
+        Bloque,
+        Segregacion,
+        MovimientoReal,
+        MovimientoModelo,
+        DistanciaReal,
+        ResultadoGeneral,
+        AsignacionBloque,
+        CargaTrabajo,
+        OcupacionBloque,
+        KPIComparativo,
+        MetricaTemporal,
+        LogProcesamiento
+    )
+    print('  ✓ Modelos de Optimization (Magdalena) importados')
 except Exception as e:
-    print(f'  ✗ Error importando magdalena: {e}')
+    print(f'  ✗ Error importando optimization: {e}')
 
+# Modelos de Camila
 try:
     from app.models.camila import (
-        ResultadoCamila, AsignacionGrua, CuotaCamion, MetricaGrua,
-        ComparacionReal, FlujoModelo, ParametroCamila, LogProcesamientoCamila,
-        EstadoProcesamiento, TipoOperacion, TipoAsignacion
+        ResultadoCamila, AsignacionGrua, cuotas_camiones, metricas_gruas,
+        comparaciones_real, flujos_modelo, parametros_camila,
+        EstadoProcesamiento, TipoOperacion, TipoAsignacion, segregaciones_mapping,logs_procesamiento_camila
     )
     print('  ✓ Modelos de Camila importados')
 except Exception as e:
     print(f'  ✗ Error importando camila: {e}')
-
-try:
-    from app.models.container_dwell_time import ContainerDwellTime
-    from app.models.truck_turnaround_time import TruckTurnaroundTime
-    print('  ✓ CDT y TTT importados')
-except Exception as e:
-    print(f'  ✗ Error importando CDT/TTT: {e}')
-
-try:
-    from app.models.container_position import ContainerPosition
-    print('  ✓ Container Position importado')
-except Exception as e:
-    print(f'  ✗ Error importando container_position: {e}')
 
 from app.core.config import get_settings
 
@@ -98,21 +107,127 @@ async def create_tables():
     print('🔧 Creando índices...')
     async with engine.connect() as conn:
         try:
+            # ========== ÍNDICES PARA TABLAS BASE ==========
+            
             # Índices para container_positions
             await conn.execute(text('''
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_container_position_unique 
                 ON container_positions (fecha, turno, gkey)
             '''))
-            
             await conn.execute(text('''
                 CREATE INDEX IF NOT EXISTS idx_container_position_bloque_fecha 
                 ON container_positions (bloque, fecha, turno)
             '''))
-            
             await conn.execute(text('''
                 CREATE INDEX IF NOT EXISTS idx_container_position_patio_fecha 
                 ON container_positions (patio, fecha, turno)
             '''))
+            
+            # Índices para movement_flows
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_movement_flows_gkey_time 
+                ON movement_flows (ime_ufv_gkey, ime_time DESC)
+            '''))
+            
+            # ========== ÍNDICES PARA MAGDALENA (OPTIMIZATION) ==========
+            
+            # Índices para instancias
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_optimization_fecha 
+                ON instancias (fecha_inicio, fecha_fin)
+            '''))
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_optimization_anio_semana 
+                ON instancias (anio, semana)
+            '''))
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_optimization_participacion 
+                ON instancias (participacion, con_dispersion)
+            '''))
+            
+            # Índices para movimientos reales
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_movreal_instancia_fecha 
+                ON movimientos_reales (instancia_id, fecha_hora)
+            '''))
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_movreal_tipo_movimiento 
+                ON movimientos_reales (tipo_movimiento)
+            '''))
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_movreal_bloques 
+                ON movimientos_reales (bloque_origen, bloque_destino)
+            '''))
+            
+            # Índices para distancias
+            await conn.execute(text('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_distancia_origen_destino 
+                ON distancias_reales (origen, destino)
+            '''))
+            
+            # Índices para asignaciones
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_asignacion_instancia_segregacion 
+                ON asignaciones_bloques (instancia_id, segregacion_id)
+            '''))
+            
+            # Índices para movimientos modelo
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_movmodelo_instancia_periodo 
+                ON movimientos_modelo (instancia_id, periodo)
+            '''))
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_movmodelo_bloque 
+                ON movimientos_modelo (bloque_id)
+            '''))
+            
+            # Índices para carga trabajo
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_carga_instancia_periodo 
+                ON carga_trabajo (instancia_id, periodo)
+            '''))
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_carga_bloque 
+                ON carga_trabajo (bloque_id)
+            '''))
+            
+            # Índices para ocupación
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_ocupacion_instancia_periodo 
+                ON ocupacion_bloques (instancia_id, periodo)
+            '''))
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_ocupacion_bloque 
+                ON ocupacion_bloques (bloque_id)
+            '''))
+            
+            # Índices para KPIs
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_kpi_instancia_categoria 
+                ON kpis_comparativos (instancia_id, categoria)
+            '''))
+            
+            # Índices para métricas temporales
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_metrica_instancia_tiempo 
+                ON metricas_temporales (instancia_id, dia, turno)
+            '''))
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_metrica_periodo 
+                ON metricas_temporales (periodo)
+            '''))
+            
+            # Índices para logs
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_log_instancia 
+                ON logs_procesamiento (instancia_id)
+            '''))
+            await conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_log_fecha 
+                ON logs_procesamiento (fecha_procesamiento)
+            '''))
+            
+            # ========== ÍNDICES PARA CAMILA ==========
             
             # Índices para resultados_camila
             await conn.execute(text('''
@@ -151,30 +266,89 @@ async def create_tables():
         print(f'\\n📋 Tablas creadas en la BD: {len(tables)}')
         
         # Agrupar por tipo
-        camila_tables = [t for t in tables if any(t.startswith(p) for p in ['resultados_camila', 'asignaciones_gruas', 'cuotas_camiones', 'metricas_gruas', 'comparaciones_camila', 'parametros_camila', 'logs_camila'])]
-        magdalena_tables = [t for t in tables if t.startswith('magdalena_') or t == 'instancias' or t == 'bloques' or t == 'segregaciones']
+        base_tables = ['historical_movements', 'movement_flows', 'container_positions', 
+                      'container_dwell_times', 'truck_turnaround_times']
         sai_tables = [t for t in tables if t.startswith('sai_')]
-        other_tables = [t for t in tables if not any(t.startswith(p) for p in ['resultados_camila', 'asignaciones_gruas', 'cuotas_camiones', 'metricas_gruas', 'comparaciones_camila', 'parametros_camila', 'logs_camila', 'magdalena_', 'instancias', 'bloques', 'segregaciones', 'sai_'])]
+        magdalena_tables = ['instancias', 'bloques', 'segregaciones', 'movimientos_reales',
+                          'movimientos_modelo', 'distancias_reales', 'resultados_generales',
+                          'asignaciones_bloques', 'carga_trabajo', 'ocupacion_bloques',
+                          'kpis_comparativos', 'metricas_temporales', 'logs_procesamiento']
+        camila_tables = ['resultados_camila', 'asignaciones_gruas', 'cuotas_camiones',
+                        'metricas_gruas', 'comparaciones_camila', 'flujos_modelo',
+                        'parametros_camila', 'logs_camila', 'segregacion_mappings']
         
-        if camila_tables:
-            print('\\n  📊 Tablas de Camila:')
-            for table in camila_tables:
-                print(f'     - {table}')
+        print('\\n  📊 Tablas Base:')
+        for table in base_tables:
+            if table in tables:
+                print(f'     ✓ {table}')
+            else:
+                print(f'     ✗ {table} (no creada)')
         
-        if magdalena_tables:
-            print('\\n  📊 Tablas de Magdalena:')
-            for table in magdalena_tables:
-                print(f'     - {table}')
+        print('\\n  📊 Tablas de SAI:')
+        for table in sai_tables:
+            print(f'     ✓ {table}')
         
-        if sai_tables:
-            print('\\n  📊 Tablas de SAI:')
-            for table in sai_tables:
-                print(f'     - {table}')
+        print('\\n  📊 Tablas de Magdalena:')
+        for table in magdalena_tables:
+            if table in tables:
+                print(f'     ✓ {table}')
+            else:
+                print(f'     ✗ {table} (no creada)')
         
-        if other_tables:
-            print('\\n  📊 Otras tablas:')
-            for table in other_tables:
-                print(f'     - {table}')
+        print('\\n  📊 Tablas de Camila:')
+        for table in camila_tables:
+            if table in tables:
+                print(f'     ✓ {table}')
+            else:
+                print(f'     ✗ {table} (no creada)')
+        
+        # Verificar estructura de algunas tablas clave
+        print('\\n📊 Verificando estructura de tablas principales:')
+        
+        # Verificar columnas de instancias (Magdalena)
+        result = await conn.execute(
+            text(\"\"\"
+                SELECT column_name, data_type 
+                FROM information_schema.columns 
+                WHERE table_name = 'instancias' 
+                ORDER BY ordinal_position
+                LIMIT 10
+            \"\"\")
+        )
+        if result.rowcount > 0:
+            print('\\n  Tabla instancias (Magdalena):')
+            for col in result:
+                print(f'     - {col[0]}: {col[1]}')
+        
+        # Verificar columnas de resultados_generales
+        result = await conn.execute(
+            text(\"\"\"
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'resultados_generales' 
+                AND column_name LIKE '%distancia%'
+                ORDER BY ordinal_position
+            \"\"\")
+        )
+        if result.rowcount > 0:
+            print('\\n  Campos de distancia en resultados_generales:')
+            for col in result:
+                print(f'     - {col[0]}')
+        
+        # Verificar columnas de resultados_camila
+        result = await conn.execute(
+            text(\"\"\"
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'resultados_camila' 
+                ORDER BY ordinal_position
+                LIMIT 10
+            \"\"\")
+        )
+        if result.rowcount > 0:
+            print('\\n  Tabla resultados_camila:')
+            for col in result:
+                print(f'     - {col[0]}')
     
     await engine.dispose()
     print('\\n✅ Proceso de creación de tablas completado!')
@@ -186,13 +360,69 @@ asyncio.run(create_tables())
 # Esperar un momento para asegurarse de que las tablas se crearon
 sleep 2
 
-# Verificar si ya hay datos históricos
-echo "🔍 Verificando datos históricos..."
+# ========== VERIFICACIÓN Y CARGA DE DATOS ==========
 
-# Verificar movimientos históricos
-HISTORICAL_COUNT=$(python -c "
+# Verificar Movement Flows
+echo ""
+echo "🔍 Verificando datos de Movement Flows..."
+MOVEMENT_FLOW_COUNT=$(python -c "
 import asyncio
 import sys
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from app.models.movement_flow import MovementFlow
+from app.core.config import get_settings
+
+async def count_records():
+    settings = get_settings()
+    engine = create_async_engine(settings.DATABASE_URL)
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    
+    try:
+        async with async_session() as db:
+            result = await db.execute(select(func.count(MovementFlow.id)))
+            count = result.scalar()
+            return count
+    except Exception as e:
+        print(f'Error: {e}', file=sys.stderr)
+        return 0
+    finally:
+        await engine.dispose()
+
+count = asyncio.run(count_records())
+print(count)
+" 2>/dev/null || echo "0")
+
+if [ "$MOVEMENT_FLOW_COUNT" -eq "0" ]; then
+    echo "📊 No hay datos de Movement Flows, verificando archivo..."
+    
+    if [ -f "data/data_2022.csv" ]; then
+        echo "📁 Archivo data_2022.csv encontrado"
+        
+        FILE_SIZE=$(stat -f%z "data/data_2022.csv" 2>/dev/null || stat -c%s "data/data_2022.csv" 2>/dev/null || echo "0")
+        FILE_SIZE_MB=$((FILE_SIZE / 1048576))
+        echo "   - Tamaño del archivo: ${FILE_SIZE_MB} MB"
+        
+        if [ "$FILE_SIZE" -gt "0" ]; then
+            echo "🚀 Iniciando carga de Movement Flows..."
+            echo "   ⚠️  Este proceso puede tomar varios minutos debido al tamaño del archivo"
+            echo "   📅 Filtrando datos desde 2017 en adelante..."
+            
+            python scripts/load_historical_data.py --all --clear --year 2022
+            
+            echo "✅ Movement Flows cargados exitosamente"
+        fi
+    fi
+else
+    echo "✅ Ya existen $MOVEMENT_FLOW_COUNT registros de Movement Flows"
+fi
+
+# Verificar Historical Movements
+echo ""
+echo "🔍 Verificando datos históricos..."
+HISTORICAL_COUNT=$(python -c "
+import asyncio
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -209,8 +439,7 @@ async def count_records():
             result = await db.execute(select(func.count(HistoricalMovement.id)))
             count = result.scalar()
             return count
-    except Exception as e:
-        print(f'Error: {e}', file=sys.stderr)
+    except:
         return 0
     finally:
         await engine.dispose()
@@ -219,97 +448,11 @@ count = asyncio.run(count_records())
 print(count)
 " 2>/dev/null || echo "0")
 
-# Verificar si ya hay datos de SAI Flujos
-echo "🔍 Verificando datos de SAI Flujos..."
-SAI_COUNT=$(python -c "
-import asyncio
-import sys
-from sqlalchemy import select, func
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-from app.models.sai_flujos import SAIConfiguration
-from app.core.config import get_settings
-
-async def count_records():
-    settings = get_settings()
-    engine = create_async_engine(settings.DATABASE_URL)
-    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    
-    try:
-        async with async_session() as db:
-            result = await db.execute(select(func.count(SAIConfiguration.id)))
-            count = result.scalar()
-            return count
-    except Exception as e:
-        print(f'Error: {e}', file=sys.stderr)
-        return 0
-    finally:
-        await engine.dispose()
-
-count = asyncio.run(count_records())
-print(count)
-" 2>/dev/null || echo "0")
-
-if [ "$SAI_COUNT" -eq "0" ]; then
-    echo "📊 No hay datos de SAI, verificando archivos..."
-
-    echo "Contenido de /app/data/magdalena/2022/instancias_magdalena:"
-    ls -l /app/data/magdalena/2022/instancias_magdalena 2>/dev/null || echo "No existe el directorio"
-
-    if [ -d "/app/data/magdalena/2022/instancias_magdalena" ]; then
-        echo "📁 Buscando archivos SAI en estructura compartida..."
-        
-        # Verificar si hay archivos de flujos
-        if find /app/data/magdalena/2022/instancias_magdalena -name "Flujos_w*.xlsx" -type f | grep -q .; then
-            echo "📁 Archivos de SAI encontrados, cargando..."
-            # python /app/scripts/load_sai_data.py
-            # python /app/scripts/load_magdalena_data.py
-            echo "✅ Datos de SAI cargados!"
-        else
-            echo "⚠️  No se encontraron archivos de SAI"
-        fi
-    else
-        echo "⚠️  No se encontró la estructura de directorios esperada"
-        echo "    Estructura esperada:"
-        echo "    - /app/data/magdalena/2022/instancias_magdalena/2022-01-03/Flujos_w*.xlsx"
-        echo "    - /app/data/magdalena/2022/instancias_magdalena/2022-01-03/Instancia_*.xlsx"
-        echo "    - /app/data/magdalena/2022/instancias_magdalena/2022-01-03/evolucion_turnos_*.xlsx"
-    fi
-else
-    echo "✅ Ya existen $SAI_COUNT configuraciones de SAI"
-fi
-# Verificar Container Positions
-CONTAINER_POS_COUNT=$(python -c "
-import asyncio
-import sys
-from sqlalchemy import select, func
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-from app.models.container_position import ContainerPosition
-from app.core.config import get_settings
-
-async def count_records():
-    settings = get_settings()
-    engine = create_async_engine(settings.DATABASE_URL)
-    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    
-    try:
-        async with async_session() as db:
-            result = await db.execute(select(func.count(ContainerPosition.id)))
-            count = result.scalar()
-            return count
-    except Exception as e:
-        return 0
-    finally:
-        await engine.dispose()
-
-count = asyncio.run(count_records())
-print(count)
-" 2>/dev/null || echo "0")
 # Verificar CDT
+echo ""
+echo "🔍 Verificando Container Dwell Time..."
 CDT_COUNT=$(python -c "
 import asyncio
-import sys
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -326,7 +469,7 @@ async def count_records():
             result = await db.execute(select(func.count(ContainerDwellTime.id)))
             count = result.scalar()
             return count
-    except Exception as e:
+    except:
         return 0
     finally:
         await engine.dispose()
@@ -336,9 +479,10 @@ print(count)
 " 2>/dev/null || echo "0")
 
 # Verificar TTT
+echo ""
+echo "🔍 Verificando Truck Turnaround Time..."
 TTT_COUNT=$(python -c "
 import asyncio
-import sys
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -355,7 +499,7 @@ async def count_records():
             result = await db.execute(select(func.count(TruckTurnaroundTime.id)))
             count = result.scalar()
             return count
-    except Exception as e:
+    except:
         return 0
     finally:
         await engine.dispose()
@@ -364,114 +508,15 @@ count = asyncio.run(count_records())
 print(count)
 " 2>/dev/null || echo "0")
 
-echo "📊 Estado de datos:"
-echo "   - Movimientos históricos: $HISTORICAL_COUNT registros"
-echo "   - Container Dwell Time: $CDT_COUNT registros"
-echo "   - Truck Turnaround Time: $TTT_COUNT registros"
-echo "   - Container Positions: $CONTAINER_POS_COUNT registros"
-# Determinar qué cargar
-LOAD_ALL=false
-if [ "$HISTORICAL_COUNT" -eq "0" ] || [ "$CDT_COUNT" -eq "0" ] || [ "$TTT_COUNT" -eq "0" ] || [ "$CONTAINER_POS_COUNT" -eq "0" ]; then
-    LOAD_ALL=true
-fi
-
-if [ "$LOAD_ALL" = true ]; then
-    echo ""
-    echo "📥 Faltan datos, verificando archivos disponibles..."
-    
-    # Verificar qué archivos existen
-    FILES_FOUND=false
-    
-    if [ -f "data/resultados_congestion_SAI_2022.csv" ]; then
-        echo "   ✓ Archivo de movimientos encontrado"
-        FILES_FOUND=true
-    else
-        echo "   ✗ Archivo de movimientos no encontrado"
-    fi
-    
-    if [ -f "data/resultados_CDT_impo_anio_SAI_2022.csv" ]; then
-        echo "   ✓ Archivo CDT importación encontrado"
-        FILES_FOUND=true
-    else
-        echo "   ✗ Archivo CDT importación no encontrado"
-    fi
-    
-    if [ -f "data/resultados_CDT_expo_anio_SAI_2022.csv" ]; then
-        echo "   ✓ Archivo CDT exportación encontrado"
-        FILES_FOUND=true
-    else
-        echo "   ✗ Archivo CDT exportación no encontrado"
-    fi
-    
-    if [ -f "data/resultados_TTT_impo_anio_SAI_2022.csv" ]; then
-        echo "   ✓ Archivo TTT importación encontrado"
-        FILES_FOUND=true
-    else
-        echo "   ✗ Archivo TTT importación no encontrado"
-    fi
-    
-    if [ -f "data/resultados_TTT_expo_anio_SAI_2022.csv" ]; then
-        echo "   ✓ Archivo TTT exportación encontrado"
-        FILES_FOUND=true
-    else
-        echo "   ✗ Archivo TTT exportación no encontrado"
-    fi
-    
-    if [ "$FILES_FOUND" = true ]; then
-        echo ""
-        echo "🚀 Iniciando carga de datos..."
-        # python scripts/load_historical_data.py --all
-        echo "✅ Proceso de carga completado!"
-    else
-        echo ""
-        echo "⚠️  No se encontraron archivos CSV en la carpeta data/"
-        echo "    Por favor, coloca los archivos CSV en la carpeta data/ antes de continuar"
-    fi
-else
-    echo ""
-    echo "✅ Todos los tipos de datos ya están cargados"
-fi
-# Verificar si ya hay datos de Container Positions
+# Verificar Container Positions
 echo ""
-echo "🔍 Verificando datos de posiciones de contenedores..."
-
-if [ "$CONTAINER_POS_COUNT" -eq "0" ]; then
-    echo "📊 No hay datos de posiciones, verificando estructura de archivos..."
-    
-    # Verificar si existe la estructura de directorios
-    if [ -d "data/2022" ]; then
-        echo "📁 Estructura de directorios encontrada"
-        
-        # Contar archivos CSV
-        CSV_COUNT=$(find data/2022 -name "*.csv" -type f | wc -l)
-        echo "   - Archivos CSV encontrados: $CSV_COUNT"
-        
-        if [ "$CSV_COUNT" -gt "0" ]; then
-            echo "🚀 Iniciando carga de posiciones de contenedores..."
-            # python /app/scripts/load_container_positions.py 
-            echo "✅ Datos de posiciones cargados!"
-        else
-            echo "⚠️  No se encontraron archivos CSV en data/2022/"
-            echo "    Estructura esperada:"
-            echo "    - data/2022/[semana-iso]/[fecha]_[turno].csv"
-            echo "    - Ejemplo: data/2022/2022-01-03/2022-01-03_08-00.csv"
-        fi
-    else
-        echo "⚠️  No se encontró el directorio data/2022/"
-        echo "    Por favor, verifica que los archivos estén en la estructura correcta"
-    fi
-else
-    echo "✅ Ya existen $CONTAINER_POS_COUNT registros de posiciones"
-fi
-# Verificar si ya hay datos de Magdalena
-echo "🔍 Verificando datos de Magdalena..."
-MAGDALENA_COUNT=$(python -c "
+echo "🔍 Verificando Container Positions..."
+CONTAINER_POS_COUNT=$(python -c "
 import asyncio
-import sys
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-from app.models.magdalena import MagdalenaRun
+from app.models.container_position import ContainerPosition
 from app.core.config import get_settings
 
 async def count_records():
@@ -481,11 +526,70 @@ async def count_records():
     
     try:
         async with async_session() as db:
-            result = await db.execute(select(func.count(MagdalenaRun.id)))
+            result = await db.execute(select(func.count(ContainerPosition.id)))
             count = result.scalar()
             return count
-    except Exception as e:
-        print(f'Error: {e}', file=sys.stderr)
+    except:
+        return 0
+    finally:
+        await engine.dispose()
+
+count = asyncio.run(count_records())
+print(count)
+" 2>/dev/null || echo "0")
+
+# Verificar datos de SAI Flujos
+echo ""
+echo "🔍 Verificando datos de SAI Flujos..."
+SAI_COUNT=$(python -c "
+import asyncio
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from app.models.sai_flujos import SAIConfiguration
+from app.core.config import get_settings
+
+async def count_records():
+    settings = get_settings()
+    engine = create_async_engine(settings.DATABASE_URL)
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    
+    try:
+        async with async_session() as db:
+            result = await db.execute(select(func.count(SAIConfiguration.id)))
+            count = result.scalar()
+            return count
+    except:
+        return 0
+    finally:
+        await engine.dispose()
+
+count = asyncio.run(count_records())
+print(count)
+" 2>/dev/null || echo "0")
+
+# Verificar datos de Magdalena
+echo ""
+echo "🔍 Verificando datos de Magdalena (Optimization)..."
+MAGDALENA_COUNT=$(python -c "
+import asyncio
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from app.models.optimization import Instancia
+from app.core.config import get_settings
+
+async def count_records():
+    settings = get_settings()
+    engine = create_async_engine(settings.DATABASE_URL)
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    
+    try:
+        async with async_session() as db:
+            result = await db.execute(select(func.count(Instancia.id)))
+            count = result.scalar()
+            return count
+    except:
         return 0
     finally:
         await engine.dispose()
@@ -496,31 +600,50 @@ print(count)
 
 if [ "$MAGDALENA_COUNT" -eq "0" ]; then
     echo "📊 No hay datos de Magdalena, verificando archivos..."
-
-    echo "Directorio actual: $(pwd)"
-    echo "Contenido de /app/data/magdalena:"
-    ls -l /app/data/magdalena 2>/dev/null || echo "No existe /app/data/magdalena"
-
-    if [ -d "/app/data/magdalena" ] && [ "$(ls -A /app/data/magdalena/*.xlsx 2>/dev/null)" ]; then
-        echo "📁 Archivos de Magdalena encontrados, cargando..."
-        #python /app/scripts/load_magdalena_data.py
-        echo "✅ Datos de Magdalena cargados!"
+    
+    # Verificar estructura de directorios
+    OPTIMIZATION_PATH="${OPTIMIZATION_DATA_PATH:-/app/optimization_data}"
+    
+    # Fallback a ruta local si no existe
+    if [ ! -d "$OPTIMIZATION_PATH" ]; then
+        if [ -d "/home/nejoo/gurobi/resultados_generados" ]; then
+            OPTIMIZATION_PATH="/home/nejoo/gurobi/resultados_generados"
+        fi
+    fi
+    
+    RESULTADOS_PATH="$OPTIMIZATION_PATH/resultados_magdalena"
+    INSTANCIAS_PATH="$OPTIMIZATION_PATH/instancias_magdalena"
+    
+    echo "📁 Buscando datos en:"
+    echo "   - Resultados: $RESULTADOS_PATH"
+    echo "   - Instancias: $INSTANCIAS_PATH"
+    
+    if [ -d "$RESULTADOS_PATH" ] && [ -d "$INSTANCIAS_PATH" ]; then
+        RESULTADO_COUNT=$(find "$RESULTADOS_PATH" -name "resultado_*.xlsx" -type f 2>/dev/null | wc -l)
+        INSTANCIA_COUNT=$(find "$INSTANCIAS_PATH" -name "Instancia_*.xlsx" -type f 2>/dev/null | wc -l)
+        
+        echo "   - Archivos de resultados encontrados: $RESULTADO_COUNT"
+        echo "   - Archivos de instancias encontrados: $INSTANCIA_COUNT"
+        
+        if [ "$RESULTADO_COUNT" -gt "0" ]; then
+            echo "🚀 Iniciando carga de datos de Magdalena..."
+            echo "   ⚠️  Este proceso puede tomar varios minutos"
+            python /app/scripts/load_magdalena_data.py      
+            echo "✅ Proceso de carga de Magdalena completado!"
+        else
+            echo "⚠️  No se encontraron archivos de resultados para cargar"
+        fi
     else
-        echo "⚠️  No se encontraron archivos de Magdalena en /app/data/magdalena/"
-        echo "    Estructura esperada:"
-        echo "    - /app/data/magdalena/resultado_3_69_K.xlsx"
-        echo "    - /app/data/magdalena/semanas/Semana 3/Instancia_3_69_K.xlsx"
-        echo "    - /app/data/magdalena/semanas/Semana 3/analisis_flujos_w3_ci.xlsx"
+        echo "❌ No se encontraron los directorios de datos"
     fi
 else
-    echo "✅ Ya existen $MAGDALENA_COUNT configuraciones de Magdalena"
+    echo "✅ Ya existen $MAGDALENA_COUNT instancias de Magdalena"
 fi
-# Verificar si ya hay datos de Camila
+# Verificar datos de Camila
 echo ""
 echo "🔍 Verificando datos de Camila..."
 CAMILA_COUNT=$(python -c "
 import asyncio
-import sys
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -537,8 +660,7 @@ async def count_records():
             result = await db.execute(select(func.count(ResultadoCamila.id)))
             count = result.scalar()
             return count
-    except Exception as e:
-        print(f'Error: {e}', file=sys.stderr)
+    except:
         return 0
     finally:
         await engine.dispose()
@@ -550,10 +672,8 @@ print(count)
 if [ "$CAMILA_COUNT" -eq "0" ]; then
     echo "📊 No hay datos de Camila, verificando archivos..."
     
-    # Verificar estructura de directorios
     OPTIMIZATION_PATH="${OPTIMIZATION_DATA_PATH:-/app/optimization_data}"
     
-    # Fallback a ruta local si no existe
     if [ ! -d "$OPTIMIZATION_PATH" ]; then
         if [ -d "/home/nejoo/gurobi/resultados_generados" ]; then
             OPTIMIZATION_PATH="/home/nejoo/gurobi/resultados_generados"
@@ -568,7 +688,6 @@ if [ "$CAMILA_COUNT" -eq "0" ]; then
     echo "   - Instancias: $CAMILA_INSTANCIAS"
     
     if [ -d "$CAMILA_RESULTADOS" ] && [ -d "$CAMILA_INSTANCIAS" ]; then
-        # Contar archivos
         RESULTADO_COUNT=$(find "$CAMILA_RESULTADOS" -name "resultado_*_T*.xlsx" -type f 2>/dev/null | wc -l)
         INSTANCIA_COUNT=$(find "$CAMILA_INSTANCIAS" -name "Instancia_*_T*.xlsx" -type f 2>/dev/null | wc -l)
         
@@ -579,25 +698,100 @@ if [ "$CAMILA_COUNT" -eq "0" ]; then
             echo "🚀 Iniciando carga masiva de datos de Camila..."
             python /app/scripts/load_camila_data_complete.py
             echo "✅ Proceso de carga de Camila completado!"
-        else
-            echo "⚠️  No se encontraron archivos de resultados"
-            echo "    Estructura esperada:"
-            echo "    - $CAMILA_RESULTADOS/[fecha]/resultado_*_T*.xlsx"
-            echo "    - $CAMILA_INSTANCIAS/[fecha]/Instancia_*_T*.xlsx"
-            echo "    Ejemplo:"
-            echo "    - $CAMILA_RESULTADOS/2022-01-03/resultado_20220103_68_K_T01.xlsx"
-            echo "    - $CAMILA_INSTANCIAS/2022-01-03/Instancia_20220103_68_K_T01.xlsx"
         fi
-    else
-        echo "⚠️  No se encontró la estructura de directorios de Camila"
-        echo "    Verifica que existan los directorios:"
-        echo "    - $CAMILA_RESULTADOS"
-        echo "    - $CAMILA_INSTANCIAS"
     fi
 else
     echo "✅ Ya existen $CAMILA_COUNT resultados de Camila"
 fi
 
-echo "🎯 Iniciando aplicación FastAPI..."
+# Resumen final
+echo ""
+echo "📊 Estado final de datos:"
+echo "   - Movement Flows: $MOVEMENT_FLOW_COUNT registros"
+echo "   - Movimientos históricos: $HISTORICAL_COUNT registros"
+echo "   - Container Dwell Time: $CDT_COUNT registros"
+echo "   - Truck Turnaround Time: $TTT_COUNT registros"
+echo "   - Container Positions: $CONTAINER_POS_COUNT registros"
+echo "   - SAI Flujos: $SAI_COUNT configuraciones"
+echo "   - Magdalena (Optimization): $MAGDALENA_COUNT instancias"
+echo "   - Camila: $CAMILA_COUNT resultados"
+
+# Actualización de bloques si hay Movement Flows nuevos
+if [ "$MOVEMENT_FLOW_COUNT" -gt "0" ] && ([ "$CDT_COUNT" -gt "0" ] || [ "$TTT_COUNT" -gt "0" ]); then
+    echo ""
+    echo "🔄 Actualizando bloques en CDT y TTT desde Movement Flows..."
+    python -c "
+import asyncio
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from app.core.config import get_settings
+
+async def update_blocks():
+    settings = get_settings()
+    engine = create_async_engine(settings.DATABASE_URL)
+    
+    async with engine.connect() as conn:
+        # Actualizar CDT
+        result = await conn.execute(text('''
+            WITH ultimo_bloque AS (
+                SELECT DISTINCT ON (ime_ufv_gkey)
+                    ime_ufv_gkey,
+                    patio,
+                    bloque
+                FROM movement_flows
+                WHERE patio IS NOT NULL 
+                  AND bloque IS NOT NULL
+                ORDER BY ime_ufv_gkey, ime_time DESC
+            )
+            UPDATE container_dwell_times cdt
+            SET 
+                patio = ub.patio,
+                bloque = ub.bloque,
+                updated_at = CURRENT_TIMESTAMP
+            FROM ultimo_bloque ub
+            WHERE cdt.iufv_gkey = ub.ime_ufv_gkey
+              AND (cdt.patio IS NULL OR cdt.bloque IS NULL)
+        '''))
+        cdt_updated = result.rowcount
+        
+        # Actualizar TTT
+        result = await conn.execute(text('''
+            WITH ultimo_bloque AS (
+                SELECT DISTINCT ON (ime_ufv_gkey)
+                    ime_ufv_gkey,
+                    patio,
+                    bloque
+                FROM movement_flows
+                WHERE patio IS NOT NULL 
+                  AND bloque IS NOT NULL
+                ORDER BY ime_ufv_gkey, ime_time DESC
+            )
+            UPDATE truck_turnaround_times ttt
+            SET 
+                patio = ub.patio,
+                bloque = ub.bloque,
+                updated_at = CURRENT_TIMESTAMP
+            FROM ultimo_bloque ub
+            WHERE ttt.iufv_gkey = ub.ime_ufv_gkey
+              AND (ttt.patio IS NULL OR ttt.bloque IS NULL)
+        '''))
+        ttt_updated = result.rowcount
+        
+        await conn.commit()
+        
+        if cdt_updated > 0 or ttt_updated > 0:
+            print(f'   - CDT actualizados: {cdt_updated}')
+            print(f'   - TTT actualizados: {ttt_updated}')
+            print('✅ Actualización de bloques completada')
+    
+    await engine.dispose()
+
+asyncio.run(update_blocks())
+"
+fi
+
+echo ""
+echo "🎯 Continuando con el inicio de la aplicación..."
+
 # Ejecutar el comando original
 exec "$@"

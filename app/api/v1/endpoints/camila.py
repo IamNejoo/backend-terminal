@@ -14,7 +14,7 @@ from app.core.database import get_db
 from app.models.camila import (
     ResultadoCamila, AsignacionGrua, CuotaCamion, MetricaGrua,
     ComparacionReal, ParametroCamila, FlujoModelo, LogProcesamientoCamila,
-    EstadoProcesamiento, TipoOperacion, TipoAsignacion
+    EstadoProcesamiento, TipoOperacion, TipoAsignacion, SegregacionMapping
 )
 
 router = APIRouter()

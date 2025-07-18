@@ -176,7 +176,25 @@ class CuotaCamion(Base):
         Index('idx_cuota_bloque', 'bloque_codigo'),
     )
 
-
+class SegregacionMapping(Base):
+    """Mapeo entre códigos de segregación del modelo y nombres reales"""
+    __tablename__ = "segregaciones_mapping"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    resultado_id = Column(UUID(as_uuid=True), ForeignKey("resultados_camila.id"), nullable=False)
+    codigo = Column(String(10), nullable=False, index=True)  # S1, S2, etc.
+    nombre = Column(String(100), nullable=False)  # expo-dry-20-HAM147
+    tipo = Column(String(20))  # EXPORT, IMPORT
+    size = Column(Integer)  # 20, 40
+    
+    # Relación
+    resultado = relationship("ResultadoCamila", backref="segregaciones_mapping")
+    
+    __table_args__ = (
+        Index('idx_segregacion_resultado_codigo', 'resultado_id', 'codigo'),
+    )
+    
+    
 class MetricaGrua(Base):
     """Métricas de desempeño por grúa"""
     __tablename__ = "metricas_gruas"

@@ -249,132 +249,132 @@ class SAIFlujosLoader:
             await self.db.rollback()
             raise
     
-async def load_evolucion_file(
-    self,
-    file_path: str,
-    config_id: UUID
-) -> Dict[str, Any]:
-    """Carga archivo de evolución de turnos"""
-    logger.info(f"Cargando evolución desde {file_path}")
-    
-    try:
-        excel_data = pd.ExcelFile(file_path)
+    async def load_evolucion_file(
+        self,
+        file_path: str,
+        config_id: UUID
+    ) -> Dict[str, Any]:
+        """Carga archivo de evolución de turnos"""
+        logger.info(f"Cargando evolución desde {file_path}")
         
-        # Obtener configuración
-        config_query = await self.db.execute(
-            select(SAIConfiguration).where(SAIConfiguration.id == config_id)
-        )
-        config = config_query.scalar_one()
-        
-        stats = {'volumen_bloques': 0, 'volumen_segregaciones': 0}
-        
-        # 1. Cargar volumen por bloques
-        if 'Volumen_Bloques' in excel_data.sheet_names:
-            df_volumen = pd.read_excel(file_path, sheet_name='Volumen_Bloques')
+        try:
+            excel_data = pd.ExcelFile(file_path)
             
-            for _, row in df_volumen.iterrows():
-                fecha = pd.to_datetime(row['Fecha'])
-                turno_str = str(row['Turno'])
-                
-                # Determinar turno numérico
-                if '08' in turno_str or '8' in turno_str:
-                    turno = 1
-                    hora_turno = "08-00"
-                elif '15' in turno_str:
-                    turno = 2
-                    hora_turno = "15-30"
-                elif '23' in turno_str:
-                    turno = 3
-                    hora_turno = "23-00"
-                else:
-                    turno = 1
-                    hora_turno = "08-00"
-                
-                volumen_bloque = SAIVolumenBloque(
-                    config_id=config_id,
-                    fecha=fecha,
-                    turno=turno,
-                    hora_turno=hora_turno,
-                    # Bloques C
-                    c1=int(row.get('C1', 0)),
-                    c2=int(row.get('C2', 0)),
-                    c3=int(row.get('C3', 0)),
-                    c4=int(row.get('C4', 0)),
-                    c5=int(row.get('C5', 0)),
-                    c6=int(row.get('C6', 0)),
-                    c7=int(row.get('C7', 0)),
-                    c8=int(row.get('C8', 0)),
-                    c9=int(row.get('C9', 0)),
-                    # Bloques H
-                    h1=int(row.get('H1', 0)),
-                    h2=int(row.get('H2', 0)),
-                    h3=int(row.get('H3', 0)),
-                    h4=int(row.get('H4', 0)),
-                    h5=int(row.get('H5', 0)),
-                    # Bloques T
-                    t1=int(row.get('T1', 0)),
-                    t2=int(row.get('T2', 0)),
-                    t3=int(row.get('T3', 0)),
-                    t4=int(row.get('T4', 0))
-                )
-                self.db.add(volumen_bloque)
-                stats['volumen_bloques'] += 1
-        
-        # 2. Cargar volumen por segregación - CORREGIDO
-        if 'Bloques_Seg_Volumen' in excel_data.sheet_names:
-            df_seg_volumen = pd.read_excel(file_path, sheet_name='Bloques_Seg_Volumen')
+            # Obtener configuración
+            config_query = await self.db.execute(
+                select(SAIConfiguration).where(SAIConfiguration.id == config_id)
+            )
+            config = config_query.scalar_one()
             
-            # Procesar cada fila directamente
-            for _, row in df_seg_volumen.iterrows():
-                bloque_str = str(row['Bloque'])
+            stats = {'volumen_bloques': 0, 'volumen_segregaciones': 0}
+            
+            # 1. Cargar volumen por bloques
+            if 'Volumen_Bloques' in excel_data.sheet_names:
+                df_volumen = pd.read_excel(file_path, sheet_name='Volumen_Bloques')
                 
-                # Solo procesar bloques válidos (C, H, T)
-                if not (bloque_str.startswith('C') or bloque_str.startswith('H') or bloque_str.startswith('T')):
-                    continue
-                
-                # IMPORTANTE: Las columnas numéricas en el Excel se llaman 1, 2, 3
-                # pandas las lee como enteros, no strings
-                volumen_seg = SAIVolumenSegregacion(
-                    config_id=config_id,
-                    bloque=bloque_str,
-                    segregacion_id=str(row['S']),
-                    segregacion_nombre=str(row['Segregacion']),
-                    turno_1=int(row[1]) if 1 in row.index else 0,  # Columna numérica 1
-                    turno_2=int(row[2]) if 2 in row.index else 0,  # Columna numérica 2
-                    turno_3=int(row[3]) if 3 in row.index else 0,  # Columna numérica 3
-                    total=int(row['Total']) if 'Total' in row.index else 0
-                )
-                
-                # Solo agregar si hay algún volumen
-                if volumen_seg.total > 0:
-                    self.db.add(volumen_seg)
-                    stats['volumen_segregaciones'] += 1
+                for _, row in df_volumen.iterrows():
+                    fecha = pd.to_datetime(row['Fecha'])
+                    turno_str = str(row['Turno'])
                     
-                    # Log para debugging
-                    if volumen_seg.total > 100:  # Solo loguear volúmenes significativos
-                        logger.debug(f"Agregando volumen: {bloque_str}-{row['S']}: "
-                                   f"T1={volumen_seg.turno_1}, T2={volumen_seg.turno_2}, "
-                                   f"T3={volumen_seg.turno_3}, Total={volumen_seg.total}")
-        
-        await self.db.commit()
-        logger.info(f"Cargados: {stats}")
-        
-        # Verificación adicional
-        total_check = await self.db.execute(
-            select(func.sum(SAIVolumenSegregacion.total))
-            .where(SAIVolumenSegregacion.config_id == config_id)
-        )
-        total_volumen = total_check.scalar() or 0
-        logger.info(f"Volumen total cargado para config {config_id}: {total_volumen} TEUs")
-        
-        return stats
-        
-    except Exception as e:
-        logger.error(f"Error cargando evolución: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        await self.db.rollback()
-        raise
+                    # Determinar turno numérico
+                    if '08' in turno_str or '8' in turno_str:
+                        turno = 1
+                        hora_turno = "08-00"
+                    elif '15' in turno_str:
+                        turno = 2
+                        hora_turno = "15-30"
+                    elif '23' in turno_str:
+                        turno = 3
+                        hora_turno = "23-00"
+                    else:
+                        turno = 1
+                        hora_turno = "08-00"
+                    
+                    volumen_bloque = SAIVolumenBloque(
+                        config_id=config_id,
+                        fecha=fecha,
+                        turno=turno,
+                        hora_turno=hora_turno,
+                        # Bloques C
+                        c1=int(row.get('C1', 0)),
+                        c2=int(row.get('C2', 0)),
+                        c3=int(row.get('C3', 0)),
+                        c4=int(row.get('C4', 0)),
+                        c5=int(row.get('C5', 0)),
+                        c6=int(row.get('C6', 0)),
+                        c7=int(row.get('C7', 0)),
+                        c8=int(row.get('C8', 0)),
+                        c9=int(row.get('C9', 0)),
+                        # Bloques H
+                        h1=int(row.get('H1', 0)),
+                        h2=int(row.get('H2', 0)),
+                        h3=int(row.get('H3', 0)),
+                        h4=int(row.get('H4', 0)),
+                        h5=int(row.get('H5', 0)),
+                        # Bloques T
+                        t1=int(row.get('T1', 0)),
+                        t2=int(row.get('T2', 0)),
+                        t3=int(row.get('T3', 0)),
+                        t4=int(row.get('T4', 0))
+                    )
+                    self.db.add(volumen_bloque)
+                    stats['volumen_bloques'] += 1
+            
+            # 2. Cargar volumen por segregación - CORREGIDO
+            if 'Bloques_Seg_Volumen' in excel_data.sheet_names:
+                df_seg_volumen = pd.read_excel(file_path, sheet_name='Bloques_Seg_Volumen')
+                
+                # Procesar cada fila directamente
+                for _, row in df_seg_volumen.iterrows():
+                    bloque_str = str(row['Bloque'])
+                    
+                    # Solo procesar bloques válidos (C, H, T)
+                    if not (bloque_str.startswith('C') or bloque_str.startswith('H') or bloque_str.startswith('T')):
+                        continue
+                    
+                    # IMPORTANTE: Las columnas numéricas en el Excel se llaman 1, 2, 3
+                    # pandas las lee como enteros, no strings
+                    volumen_seg = SAIVolumenSegregacion(
+                        config_id=config_id,
+                        bloque=bloque_str,
+                        segregacion_id=str(row['S']),
+                        segregacion_nombre=str(row['Segregacion']),
+                        turno_1=int(row[1]) if 1 in row.index else 0,  # Columna numérica 1
+                        turno_2=int(row[2]) if 2 in row.index else 0,  # Columna numérica 2
+                        turno_3=int(row[3]) if 3 in row.index else 0,  # Columna numérica 3
+                        total=int(row['Total']) if 'Total' in row.index else 0
+                    )
+                    
+                    # Solo agregar si hay algún volumen
+                    if volumen_seg.total > 0:
+                        self.db.add(volumen_seg)
+                        stats['volumen_segregaciones'] += 1
+                        
+                        # Log para debugging
+                        if volumen_seg.total > 100:  # Solo loguear volúmenes significativos
+                            logger.debug(f"Agregando volumen: {bloque_str}-{row['S']}: "
+                                    f"T1={volumen_seg.turno_1}, T2={volumen_seg.turno_2}, "
+                                    f"T3={volumen_seg.turno_3}, Total={volumen_seg.total}")
+            
+            await self.db.commit()
+            logger.info(f"Cargados: {stats}")
+            
+            # Verificación adicional
+            total_check = await self.db.execute(
+                select(func.sum(SAIVolumenSegregacion.total))
+                .where(SAIVolumenSegregacion.config_id == config_id)
+            )
+            total_volumen = total_check.scalar() or 0
+            logger.info(f"Volumen total cargado para config {config_id}: {total_volumen} TEUs")
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error cargando evolución: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await self.db.rollback()
+            raise
     
     async def calculate_bahias_distribution(
         self,

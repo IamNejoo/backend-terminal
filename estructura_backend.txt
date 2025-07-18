@@ -1,0 +1,114 @@
+.
+├── ./Dockerfile
+├── ./README.md
+├── ./app
+│   ├── ./app/__pycache__
+│   │   └── ./app/__pycache__/main.cpython-311.pyc
+│   ├── ./app/api
+│   │   ├── ./app/api/__init__.py
+│   │   ├── ./app/api/__pycache__
+│   │   │   └── ./app/api/__pycache__/__init__.cpython-311.pyc
+│   │   └── ./app/api/v1
+│   │       ├── ./app/api/v1/__init__.py
+│   │       ├── ./app/api/v1/__pycache__
+│   │       │   ├── ./app/api/v1/__pycache__/__init__.cpython-311.pyc
+│   │       │   └── ./app/api/v1/__pycache__/router.cpython-311.pyc
+│   │       ├── ./app/api/v1/endpoints
+│   │       │   ├── ./app/api/v1/endpoints/__init__.py
+│   │       │   ├── ./app/api/v1/endpoints/__pycache__
+│   │       │   │   ├── ./app/api/v1/endpoints/__pycache__/__init__.cpython-311.pyc
+│   │       │   │   ├── ./app/api/v1/endpoints/__pycache__/camila.cpython-311.pyc
+│   │       │   │   ├── ./app/api/v1/endpoints/__pycache__/container_positions.cpython-311.pyc
+│   │       │   │   ├── ./app/api/v1/endpoints/__pycache__/historical.cpython-311.pyc
+│   │       │   │   ├── ./app/api/v1/endpoints/__pycache__/magdalena.cpython-311.pyc
+│   │       │   │   ├── ./app/api/v1/endpoints/__pycache__/optimization.cpython-311.pyc
+│   │       │   │   └── ./app/api/v1/endpoints/__pycache__/sai_flujos.cpython-311.pyc
+│   │       │   ├── ./app/api/v1/endpoints/camila.py
+│   │       │   ├── ./app/api/v1/endpoints/container_positions.py
+│   │       │   ├── ./app/api/v1/endpoints/historical.py
+│   │       │   ├── ./app/api/v1/endpoints/optimization.py
+│   │       │   └── ./app/api/v1/endpoints/sai_flujos.py
+│   │       └── ./app/api/v1/router.py
+│   ├── ./app/core
+│   │   ├── ./app/core/__pycache__
+│   │   │   ├── ./app/core/__pycache__/config.cpython-311.pyc
+│   │   │   ├── ./app/core/__pycache__/constants.cpython-311.pyc
+│   │   ├── ./app/core/config.py
+│   │   ├── ./app/core/constants.py
+│   ├── ./app/main.py
+│   ├── ./app/models
+│   │   ├── ./app/models/__init__.py
+│   │   ├── ./app/models/__pycache__
+│   │   │   ├── ./app/models/__pycache__/__init__.cpython-311.pyc
+│   │   │   ├── ./app/models/__pycache__/base.cpython-311.pyc
+│   │   │   ├── ./app/models/__pycache__/camila.cpython-311.pyc
+│   │   │   ├── ./app/models/__pycache__/container_dwell_time.cpython-311.pyc
+│   │   │   ├── ./app/models/__pycache__/container_position.cpython-311.pyc
+│   │   │   ├── ./app/models/__pycache__/historical_movements.cpython-311.pyc
+│   │   │   ├── ./app/models/__pycache__/magdalena.cpython-311.pyc
+│   │   │   ├── ./app/models/__pycache__/movement_flow.cpython-311.pyc
+│   │   │   ├── ./app/models/__pycache__/optimization.cpython-311.pyc
+│   │   │   ├── ./app/models/__pycache__/sai_flujos.cpython-311.pyc
+│   │   │   └── ./app/models/__pycache__/truck_turnaround_time.cpython-311.pyc
+│   │   ├── ./app/models/base.py
+│   │   ├── ./app/models/camila.py
+│   │   ├── ./app/models/container_dwell_time.py
+│   │   ├── ./app/models/container_position.py
+│   │   ├── ./app/models/historical_movements.py
+│   │   ├── ./app/models/movement_flow.py
+│   │   ├── ./app/models/optimization.py
+│   │   ├── ./app/models/sai_flujos.py
+│   │   └── ./app/models/truck_turnaround_time.py
+│   ├── ./app/schemas
+│   │   ├── ./app/schemas/__init__.py
+│   │   ├── ./app/schemas/__pycache__
+│   │   │   ├── ./app/schemas/__pycache__/__init__.cpython-311.pyc
+│   │   │   ├── ./app/schemas/__pycache__/camila.cpython-311.pyc
+│   │   │   ├── ./app/schemas/__pycache__/container_positions.cpython-311.pyc
+│   │   │   ├── ./app/schemas/__pycache__/magdalena.cpython-311.pyc
+│   │   │   └── ./app/schemas/__pycache__/sai_flujos.cpython-311.pyc
+│   │   ├── ./app/schemas/camila.py
+│   │   ├── ./app/schemas/container_positions.py
+│   │   ├── ./app/schemas/magdalena.py
+│   │   └── ./app/schemas/sai_flujos.py
+│   ├── ./app/services
+│   │   ├── ./app/services/__init__.py
+│   │   ├── ./app/services/__pycache__
+│   │   │   ├── ./app/services/__pycache__/__init__.cpython-311.pyc
+│   │   │   ├── ./app/services/__pycache__/camila_loader.cpython-311.pyc
+│   │   │   ├── ./app/services/__pycache__/camila_service.cpython-311.pyc
+│   │   │   ├── ./app/services/__pycache__/csv_loader.cpython-311.pyc
+│   │   │   ├── ./app/services/__pycache__/magdalena_loader.cpython-311.pyc
+│   │   │   ├── ./app/services/__pycache__/magdalena_service.cpython-311.pyc
+│   │   │   ├── ./app/services/__pycache__/movement_flow_loader.cpython-311.pyc
+│   │   │   ├── ./app/services/__pycache__/optimization_loader.cpython-311.pyc
+│   │   │   └── ./app/services/__pycache__/sai_flujos_loader.cpython-311.pyc
+│   │   ├── ./app/services/camila_loader.py
+│   │   ├── ./app/services/csv_loader.py
+│   │   ├── ./app/services/movement_flow_loader.py
+│   │   ├── ./app/services/optimization_loader.py
+│   │   └── ./app/services/sai_flujos_loader.py
+│   ├── ./app/tasks
+│   │   └── ./app/tasks/__init__.py
+│   └── ./app/utils
+│       └── ./app/utils/__init__.py
+├── ./arbol-completo.txt
+├── ./bfg-1.14.0.jar
+├── ./bfg-patterns.txt
+├── ./docker-compose.yml
+├── ./estructura.txt
+├── ./package-lock.json
+├── ./requirements.txt
+└── ./scripts
+    ├── ./scripts/docker-entrypoint.sh
+    ├── ./scripts/init_db.py
+    ├── ./scripts/load_camila_data_complete.py
+    ├── ./scripts/load_container_positions.py
+    ├── ./scripts/load_historical_data.py
+    ├── ./scripts/load_magdalena_data.py
+    ├── ./scripts/load_movement_flows.py
+    ├── ./scripts/load_sai_data.py
+    ├── ./scripts/reload_ttt.py
+    └── ./scripts/test_connection.py
+
+620 directories, 9807 files

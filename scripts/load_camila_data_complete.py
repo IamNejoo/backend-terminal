@@ -358,7 +358,54 @@ async def load_camila_data():
                 
     except Exception as e:
         print(f"\n⚠️ Error en verificación de base de datos: {str(e)}")
+    print(f"\n📊 VERIFICACIÓN DE MAPEO DE SEGREGACIONES:")
+    try:
+        async with AsyncSessionLocal() as db:
+            # Importar el modelo si no está importado
+            from app.models.camila import SegregacionMapping
+            
+            # Contar mapeos
+            mapping_query = """
+                SELECT COUNT(DISTINCT resultado_id) as resultados,
+                    COUNT(*) as total_mapeos,
+                    COUNT(DISTINCT codigo) as codigos_unicos,
+                    COUNT(DISTINCT nombre) as nombres_unicos,
+                    STRING_AGG(DISTINCT tipo, ', ') as tipos
+                FROM segregaciones_mapping
+            """
+            result = await db.execute(text(mapping_query))
+            row = result.fetchone()
+            
+            if row and row.total_mapeos > 0:
+                print(f"   ✓ Resultados con mapeo: {row.resultados}")
+                print(f"   ✓ Total mapeos: {row.total_mapeos}")
+                print(f"   ✓ Códigos únicos: {row.codigos_unicos} (S1, S2, ...)")
+                print(f"   ✓ Nombres únicos: {row.nombres_unicos}")
+                print(f"   ✓ Tipos: {row.tipos}")
+                
+                # Mostrar algunos ejemplos
+                ejemplos_query = """
+                    SELECT DISTINCT codigo, nombre, tipo
+                    FROM segregaciones_mapping
+                    LIMIT 5
+                """
+                ejemplos_result = await db.execute(text(ejemplos_query))
+                ejemplos = ejemplos_result.fetchall()
+                
+                if ejemplos:
+                    print(f"\n   📋 Ejemplos de mapeo:")
+                    for ej in ejemplos:
+                        print(f"      {ej.codigo} → {ej.nombre} ({ej.tipo})")
+            else:
+                print(f"   ⚠️ No se encontraron mapeos de segregación en la BD")
+                print(f"      Esto causará que las comparaciones con datos reales sean incorrectas")
+                
+    except Exception as e:
+        print(f"   ❌ Error verificando mapeos: {e}")
 
+    # Continuar con el resumen final existente...
+    print(f"\n{'='*80}")
+    print(f"✅ CARGA COMPLETA DE CAMILA - {datetime.now()}")
 if __name__ == "__main__":
     print(f"🚀 Iniciando carga de datos de Camila con comparación real - {datetime.now()}")
     print(f"="*80)

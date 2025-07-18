@@ -15,7 +15,7 @@ from pathlib import Path
 from app.models.camila import (
     ResultadoCamila, AsignacionGrua, CuotaCamion, MetricaGrua,
     ComparacionReal, FlujoModelo, ParametroCamila, LogProcesamientoCamila,
-    EstadoProcesamiento, TipoOperacion, TipoAsignacion
+    EstadoProcesamiento, TipoOperacion, TipoAsignacion, SegregacionMapping
 )
 
 logger = logging.getLogger(__name__)
@@ -62,10 +62,17 @@ class CamilaLoader:
         try:
             # 1. Crear o actualizar resultado de Camila
             resultado_camila = await self._create_or_update_resultado(
-                fecha_inicio, semana, anio, turno, participacion, con_dispersion,
-                resultado_filepath, instancia_filepath, flujos_real_filepath
-            )
+            fecha_inicio, semana, anio, turno, participacion, con_dispersion,
+            resultado_filepath, instancia_filepath, flujos_real_filepath)
             
+            
+            segregacion_map = {}
+            if instancia_filepath and Path(instancia_filepath).exists():
+                segregacion_map = await self._load_segregacion_mapping(
+                    instancia_filepath, 
+                    resultado_camila.id
+                )
+                logger.info(f"Mapeo de segregaciones cargado: {len(segregacion_map)} entradas")
             # Actualizar log con resultado_id
             log_proceso.resultado_id = resultado_camila.id
             
@@ -74,7 +81,7 @@ class CamilaLoader:
                 await self._load_parametros(instancia_filepath)
             
             # 3. Cargar archivo de resultado (output del modelo)
-            stats_modelo = await self._load_resultado_file(resultado_filepath, resultado_camila.id)
+            stats_modelo = await self._load_resultado_file(resultado_filepath, resultado_camila.id,segregacion_map)
             
             # 4. Cargar archivo de instancia para demandas y capacidades
             stats_instancia = {}
@@ -127,7 +134,184 @@ class CamilaLoader:
             import traceback
             logger.error(traceback.format_exc())
             raise
-    
+    async def _compare_with_reality(
+        self, resultado_id: UUID, flujos_filepath: str, 
+        fecha_inicio: datetime, turno: int
+    ):
+        """Compara resultados del modelo con datos reales"""
+        
+        logger.info(f"Comparando con datos reales del turno {turno}...")
+        
+        try:
+            # Calcular rango de tiempo del turno
+            dia = ((turno - 1) // 3) + 1
+            turno_del_dia = ((turno - 1) % 3) + 1
+            hora_inicio = {1: 8, 2: 16, 3: 0}[turno_del_dia]
+            
+            fecha_turno_inicio = fecha_inicio + timedelta(days=dia-1, hours=hora_inicio)
+            fecha_turno_fin = fecha_turno_inicio + timedelta(hours=8)
+            
+            # Cargar flujos reales
+            df_flujos = pd.read_excel(flujos_filepath)
+            df_flujos['ime_time'] = pd.to_datetime(df_flujos['ime_time'])
+            
+            # NUEVO: Obtener segregaciones del modelo desde flujos_modelo
+            flujos_modelo_result = await self.db.execute(
+                select(FlujoModelo.segregacion_codigo).distinct()
+                .where(FlujoModelo.resultado_id == resultado_id)
+            )
+            segregaciones_modelo = set(flujos_modelo_result.scalars().all())
+            logger.info(f"📋 Segregaciones en el modelo: {len(segregaciones_modelo)} - {sorted(list(segregaciones_modelo))}")
+            
+            # Obtener mapeo de segregaciones desde la BD
+            mapping_result = await self.db.execute(
+                select(SegregacionMapping)
+                .where(SegregacionMapping.resultado_id == resultado_id)
+            )
+            mappings = mapping_result.scalars().all()
+            
+            # Crear diccionario de mapeo nombre -> código
+            mapeo_nombre_codigo = {}
+            for mapping in mappings:
+                # Mapear tanto el nombre completo como versiones simplificadas
+                mapeo_nombre_codigo[mapping.nombre.lower()] = mapping.codigo
+                mapeo_nombre_codigo[mapping.nombre] = mapping.codigo
+                # También mapear sin guiones y espacios
+                nombre_simplificado = mapping.nombre.replace('-', '').replace(' ', '').lower()
+                mapeo_nombre_codigo[nombre_simplificado] = mapping.codigo
+            
+            logger.info(f"📋 Mapeo de segregaciones cargado: {len(mappings)} entradas")
+            
+            # Filtrar por turno y tipos de movimiento
+            tipos_comparables = ['RECV', 'DLVR', 'LOAD', 'DSCH']
+            df_turno = df_flujos[
+                (df_flujos['ime_time'] >= fecha_turno_inicio) &
+                (df_flujos['ime_time'] < fecha_turno_fin) &
+                (df_flujos['ime_move_kind'].isin(tipos_comparables))
+            ].copy()
+            
+            logger.info(f"Movimientos totales en el turno: {len(df_turno)}")
+            
+            # FILTRAR POR SEGREGACIONES DEL MODELO
+            columna_segregacion = None
+            for col in ['criterio_ii', 'segregacion', 'segregation', 'criterio', 'Criterio_II']:
+                if col in df_turno.columns:
+                    columna_segregacion = col
+                    break
+            
+            if columna_segregacion and len(segregaciones_modelo) > 0:
+                logger.info(f"Filtrando por columna '{columna_segregacion}'")
+                
+                # Normalizar columna de segregación
+                df_turno['segregacion_norm'] = df_turno[columna_segregacion].astype(str).str.strip()
+                
+                # Función para mapear segregación real a código del modelo
+                def mapear_segregacion(seg_real):
+                    seg_real_lower = str(seg_real).lower().strip()
+                    seg_real_simple = seg_real_lower.replace('-', '').replace(' ', '')
+                    
+                    # Buscar en el mapeo
+                    if seg_real_lower in mapeo_nombre_codigo:
+                        return mapeo_nombre_codigo[seg_real_lower]
+                    elif seg_real_simple in mapeo_nombre_codigo:
+                        return mapeo_nombre_codigo[seg_real_simple]
+                    elif seg_real.upper() in segregaciones_modelo:
+                        return seg_real.upper()
+                    else:
+                        return None
+                
+                # Aplicar mapeo
+                df_turno['segregacion_codigo'] = df_turno['segregacion_norm'].apply(mapear_segregacion)
+                
+                # Debug: mostrar mapeos
+                mapeos_unicos = df_turno[['segregacion_norm', 'segregacion_codigo']].drop_duplicates()
+                logger.info(f"Ejemplos de mapeo: {mapeos_unicos.head(10).to_dict('records')}")
+                
+                # Filtrar solo segregaciones del modelo
+                df_pre_filtro = len(df_turno)
+                df_turno = df_turno[df_turno['segregacion_codigo'].isin(segregaciones_modelo)]
+                
+                logger.info(f"✅ Movimientos después de filtrar por segregaciones: {len(df_turno)} "
+                        f"(se filtraron {df_pre_filtro - len(df_turno)} movimientos)")
+            
+            # Filtrar solo Costanera
+            bloques_costanera = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']
+            df_turno = df_turno[
+                (df_turno['ime_fm'].isin(bloques_costanera + ['GATE'])) | 
+                (df_turno['ime_to'].isin(bloques_costanera + ['GATE']))
+            ]
+            
+            logger.info(f"📊 MOVIMIENTOS FINALES PARA COMPARACIÓN: {len(df_turno)}")
+            
+            logger.info(f"📊 Movimientos finales para comparación: {len(df_turno)}")
+            
+            # Mapear hora a periodo (1-8)
+            df_turno['hora'] = df_turno['ime_time'].dt.hour
+            
+            # Calcular periodo basado en la hora del turno
+            def calcular_periodo(hora, hora_inicio_turno):
+                if hora_inicio_turno == 0:  # Turno nocturno (00:00-08:00)
+                    if hora < 8:
+                        return hora + 1
+                    else:
+                        return 8  # Cualquier hora fuera del rango va al último periodo
+                else:
+                    # Turnos diurnos
+                    if hora >= hora_inicio_turno and hora < hora_inicio_turno + 8:
+                        return hora - hora_inicio_turno + 1
+                    else:
+                        return 8  # Fuera del rango
+            
+            df_turno['periodo'] = df_turno['hora'].apply(lambda h: calcular_periodo(h, hora_inicio))
+            
+            # Validar periodos
+            df_turno.loc[df_turno['periodo'] > 8, 'periodo'] = 8
+            df_turno.loc[df_turno['periodo'] < 1, 'periodo'] = 1
+            
+            # Log distribución por periodo
+            periodos_count = df_turno['periodo'].value_counts().sort_index()
+            logger.info(f"Distribución por periodo: {periodos_count.to_dict()}")
+            
+            # Procesar datos reales
+            stats_real = await self._process_real_data(df_turno, resultado_id)
+            
+            # Crear comparaciones
+            await self._create_comparisons(resultado_id, stats_real)
+            
+            # Actualizar cuotas con datos reales
+            await self._update_quotas_with_real(resultado_id, df_turno)
+            
+            # Actualizar resultado principal
+            resultado = await self.db.get(ResultadoCamila, resultado_id)
+            resultado.total_movimientos_real = stats_real['total_movimientos']
+            
+            # Calcular accuracy
+            if resultado.total_movimientos_modelo > 0 and stats_real['total_movimientos'] > 0:
+                resultado.accuracy_global = round(
+                    min(resultado.total_movimientos_modelo, stats_real['total_movimientos']) /
+                    max(resultado.total_movimientos_modelo, stats_real['total_movimientos']) * 100,
+                    2
+                )
+                resultado.brecha_movimientos = stats_real['total_movimientos'] - resultado.total_movimientos_modelo
+            else:
+                resultado.accuracy_global = 0
+                resultado.brecha_movimientos = stats_real['total_movimientos'] - resultado.total_movimientos_modelo
+            
+            # Log final
+            logger.info(f"✅ COMPARACIÓN COMPLETADA:")
+            logger.info(f"   - Movimientos Modelo: {resultado.total_movimientos_modelo}")
+            logger.info(f"   - Movimientos Real (filtrado): {stats_real['total_movimientos']}")
+            logger.info(f"   - Accuracy: {resultado.accuracy_global}%")
+            logger.info(f"   - Brecha: {resultado.brecha_movimientos:+d}")
+            
+            await self.db.flush()
+            
+        except Exception as e:
+            logger.error(f"❌ Error comparando con realidad: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            # Re-lanzar para que el proceso principal pueda manejarlo
+            raise
     async def _create_or_update_resultado(
         self, fecha_inicio: datetime, semana: int, anio: int,
         turno: int, participacion: int, con_dispersion: bool,
@@ -241,7 +425,7 @@ class CamilaLoader:
         except Exception as e:
             logger.warning(f"Error cargando parámetros: {e}")
     
-    async def _load_resultado_file(self, filepath: str, resultado_id: UUID) -> Dict[str, Any]:
+    async def _load_resultado_file(self, filepath: str, resultado_id: UUID, segregacion_map: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """Carga archivo de resultados de Camila (output del modelo)"""
         
         logger.info("Cargando archivo de resultados del modelo...")
@@ -250,21 +434,28 @@ class CamilaLoader:
             df = pd.read_excel(filepath, header=None, names=['var', 'idx', 'val'])
             logger.info(f"Archivo con {len(df)} filas")
             
+            # Estructuras para tracking
+            segregaciones_encontradas = set()
+            bloques_encontrados = set()
+            
             stats = {
                 'total_registros': len(df),
                 'total_movimientos': 0,
-                'bloques_visitados': [],  # Cambiar a lista
-                'segregaciones_atendidas': [],  # Cambiar a lista
-                'periodos_activos': [],  # Cambiar a lista
-                'gruas_activas': [],  # Cambiar a lista
+                'bloques_visitados': set(),  # Cambiar a set para evitar duplicados
+                'segregaciones_atendidas': set(),  # Cambiar a set
+                'periodos_activos': set(),  # Cambiar a set
+                'gruas_activas': set(),  # Cambiar a set
                 'asignaciones_grua': {},
-                'flujos_por_tipo': {'fr': 0, 'fe': 0, 'fc': 0, 'fd': 0}
+                'flujos_por_tipo': {'fr': 0, 'fe': 0, 'fc': 0, 'fd': 0},
+                'movimientos_por_segregacion': {},  # NUEVO: tracking por segregación
+                'movimientos_por_bloque': {}  # NUEVO: tracking por bloque
             }
             
             batch_flujos = []
             batch_asignaciones = []
-            asignaciones_dict = {}  # Para acumular por grúa-bloque-periodo
+            asignaciones_dict = {}
             
+            # Procesar cada fila
             for idx, row in df.iterrows():
                 try:
                     if pd.isna(row['var']) or pd.isna(row['val']):
@@ -284,6 +475,26 @@ class CamilaLoader:
                             segregacion = match.group(1).upper()  # s1 -> S1
                             bloque = match.group(2).upper().replace('B', 'C')  # b1 -> C1
                             periodo = int(match.group(3))
+                            cantidad = int(var_value)
+                            
+                            # Tracking
+                            segregaciones_encontradas.add(segregacion)
+                            bloques_encontrados.add(bloque)
+                            
+                            # Actualizar estadísticas
+                            stats['bloques_visitados'].add(bloque)
+                            stats['segregaciones_atendidas'].add(segregacion)
+                            stats['periodos_activos'].add(periodo)
+                            
+                            # Tracking por segregación
+                            if segregacion not in stats['movimientos_por_segregacion']:
+                                stats['movimientos_por_segregacion'][segregacion] = 0
+                            stats['movimientos_por_segregacion'][segregacion] += cantidad
+                            
+                            # Tracking por bloque
+                            if bloque not in stats['movimientos_por_bloque']:
+                                stats['movimientos_por_bloque'][bloque] = 0
+                            stats['movimientos_por_bloque'][bloque] += cantidad
                             
                             # Determinar tipo de operación
                             tipo_map = {
@@ -300,28 +511,21 @@ class CamilaLoader:
                                 segregacion_codigo=segregacion,
                                 bloque_codigo=bloque,
                                 periodo=periodo,
-                                cantidad=int(var_value),
+                                cantidad=cantidad,
                                 tipo_operacion=tipo_map[tipo_flujo]
                             )
                             batch_flujos.append(flujo)
                             
-                            if bloque not in stats['bloques_visitados']:
-                                stats['bloques_visitados'].append(bloque)
-                            if segregacion not in stats['segregaciones_atendidas']:
-                                stats['segregaciones_atendidas'].append(segregacion)
-                            if periodo not in stats['periodos_activos']:
-                                stats['periodos_activos'].append(periodo)
-                            
-                            stats['total_movimientos'] += int(var_value)
-                            stats['flujos_por_tipo'][tipo_flujo] += int(var_value)
+                            stats['total_movimientos'] += cantidad
+                            stats['flujos_por_tipo'][tipo_flujo] += cantidad
                     
                     # Procesar asignaciones de grúas (ygbt)
                     elif var_name == 'ygbt' and var_value == 1:
                         match = re.match(r"\('([^']+)',\s*'([^']+)',\s*(\d+)\)", var_index)
                         if match:
-                            grua = match.group(1).upper()  # g1 -> G1
+                            grua = match.group(1).upper()
                             grua_id = int(grua.replace('G', ''))
-                            bloque = match.group(2).upper().replace('B', 'C')  # b1 -> C1
+                            bloque = match.group(2).upper().replace('B', 'C')
                             periodo = int(match.group(3))
                             
                             key = (grua_id, bloque, periodo)
@@ -332,11 +536,7 @@ class CamilaLoader:
                                     'movimientos': 0
                                 }
                             asignaciones_dict[key]['asignada'] = True
-                            
-                            # Usar append con verificación en lugar de add
-                            if grua_id not in stats['gruas_activas']:
-                                stats['gruas_activas'].append(grua_id)
-                            
+                            stats['gruas_activas'].add(grua_id)
                             stats['asignaciones_grua'][key] = True
                     
                     # Procesar activaciones (alpha_gbt)
@@ -356,7 +556,7 @@ class CamilaLoader:
                                     'movimientos': 0
                                 }
                             asignaciones_dict[key]['activada'] = True
-                    
+                        
                 except Exception as e:
                     logger.warning(f"Error en fila {idx}: {str(e)}")
             
@@ -364,13 +564,19 @@ class CamilaLoader:
             if batch_flujos:
                 self.db.add_all(batch_flujos)
                 await self.db.flush()
+                logger.info(f"✅ Guardados {len(batch_flujos)} flujos")
             
-            # Calcular movimientos por asignación basándose en los flujos
+            # Calcular movimientos por asignación
             for flujo in batch_flujos:
-                # Buscar qué grúas podrían haber atendido este flujo
                 for (grua_id, bloque, periodo), asig_data in asignaciones_dict.items():
                     if bloque == flujo.bloque_codigo and periodo == flujo.periodo and asig_data['asignada']:
-                        asig_data['movimientos'] += flujo.cantidad
+                        # Distribuir movimientos entre grúas asignadas al bloque-periodo
+                        gruas_en_bloque_periodo = sum(
+                            1 for (g, b, p), data in asignaciones_dict.items() 
+                            if b == bloque and p == periodo and data['asignada']
+                        )
+                        if gruas_en_bloque_periodo > 0:
+                            asig_data['movimientos'] += flujo.cantidad // gruas_en_bloque_periodo
             
             # Crear asignaciones
             for (grua_id, bloque, periodo), asig_data in asignaciones_dict.items():
@@ -389,15 +595,44 @@ class CamilaLoader:
             if batch_asignaciones:
                 self.db.add_all(batch_asignaciones)
                 await self.db.flush()
+                logger.info(f"✅ Guardadas {len(batch_asignaciones)} asignaciones")
             
-            # Calcular cuotas basadas en asignaciones
+            # Calcular cuotas
             await self._calculate_truck_quotas(resultado_id, batch_asignaciones)
             
-            logger.info(f"Resultados cargados: {stats}")
+            # Convertir sets a listas para el return
+            stats['bloques_visitados'] = sorted(list(stats['bloques_visitados']))
+            stats['segregaciones_atendidas'] = sorted(list(stats['segregaciones_atendidas']))
+            stats['periodos_activos'] = sorted(list(stats['periodos_activos']))
+            stats['gruas_activas'] = sorted(list(stats['gruas_activas']))
+            
+            # LOG DE VERIFICACIÓN CRÍTICO
+            logger.info("="*60)
+            logger.info("📋 VERIFICACIÓN DE MODELO CAMILA:")
+            logger.info("="*60)
+            logger.info(f"📊 Total movimientos modelo: {stats['total_movimientos']}")
+            logger.info(f"📋 Segregaciones procesadas: {len(segregaciones_encontradas)} - {sorted(list(segregaciones_encontradas))}")
+            logger.info(f"📦 Bloques activos: {len(bloques_encontrados)} - {sorted(list(bloques_encontrados))}")
+            logger.info(f"🚚 Flujos por tipo: {stats['flujos_por_tipo']}")
+            logger.info(f"⏰ Periodos activos: {stats['periodos_activos']}")
+            logger.info(f"🏗️ Grúas utilizadas: {len(stats['gruas_activas'])}")
+            
+            logger.info("\n📊 Movimientos por segregación:")
+            for seg, mov in sorted(stats['movimientos_por_segregacion'].items()):
+                logger.info(f"   {seg}: {mov} movimientos")
+            
+            logger.info("\n📊 Movimientos por bloque:")
+            for bloque, mov in sorted(stats['movimientos_por_bloque'].items()):
+                logger.info(f"   {bloque}: {mov} movimientos")
+            
+            logger.info("="*60)
+            
             return stats
             
         except Exception as e:
-            logger.error(f"Error cargando resultados: {e}")
+            logger.error(f"❌ Error cargando resultados: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             raise
     
     async def _load_instancia_file(self, filepath: str, resultado_id: UUID) -> Dict[str, Any]:
@@ -629,78 +864,67 @@ class CamilaLoader:
         await self.db.flush()
         logger.info(f"✓ Métricas calculadas: Movimientos={total_movimientos}, "
                    f"Utilización={utilizacion:.1f}%, CV={cv:.1f}%")
-    
-    async def _compare_with_reality(
-        self, resultado_id: UUID, flujos_filepath: str, 
-        fecha_inicio: datetime, turno: int
-    ):
-        """Compara resultados del modelo con datos reales"""
+    async def _load_segregacion_mapping(
+        self, 
+        instancia_filepath: str, 
+        resultado_id: UUID
+    ) -> Dict[str, str]:
+        """Carga el mapeo de segregaciones desde la instancia"""
         
-        logger.info(f"Comparando con datos reales del turno {turno}...")
+        logger.info("Cargando mapeo de segregaciones...")
         
         try:
-            # Calcular rango de tiempo del turno
-            dia = ((turno - 1) // 3) + 1
-            turno_del_dia = ((turno - 1) % 3) + 1
-            hora_inicio = {1: 8, 2: 16, 3: 0}[turno_del_dia]
+            xl = pd.ExcelFile(instancia_filepath)
+            segregacion_map = {}
             
-            fecha_turno_inicio = fecha_inicio + timedelta(days=dia-1, hours=hora_inicio)
-            fecha_turno_fin = fecha_turno_inicio + timedelta(hours=8)
-            
-            # Cargar flujos reales
-            df_flujos = pd.read_excel(flujos_filepath)
-            
-            # Convertir columna de tiempo a datetime
-            df_flujos['ime_time'] = pd.to_datetime(df_flujos['ime_time'])
-            
-            # Filtrar por turno y tipos de movimiento comparables
-            tipos_comparables = ['RECV', 'DLVR', 'LOAD', 'DSCH']
-            df_turno = df_flujos[
-                (df_flujos['ime_time'] >= fecha_turno_inicio) &
-                (df_flujos['ime_time'] < fecha_turno_fin) &
-                (df_flujos['ime_move_kind'].isin(tipos_comparables))
-            ].copy()
-            
-            logger.info(f"Movimientos reales en turno: {len(df_turno)}")
-            
-            # Mapear hora a periodo (1-8)
-            df_turno['hora'] = df_turno['ime_time'].dt.hour
-            df_turno['periodo'] = df_turno['hora'].apply(
-                lambda h: ((h - hora_inicio) % 24) + 1 if h >= hora_inicio or hora_inicio == 0 else ((h + 24 - hora_inicio) % 24) + 1
-            )
-            
-            # Procesar datos reales
-            stats_real = await self._process_real_data(df_turno, resultado_id)
-            
-            # Crear comparaciones
-            await self._create_comparisons(resultado_id, stats_real)
-            
-            # Actualizar cuotas con datos reales
-            await self._update_quotas_with_real(resultado_id, df_turno)
-            
-            # Actualizar resultado principal
-            resultado = await self.db.get(ResultadoCamila, resultado_id)
-            resultado.total_movimientos_real = stats_real['total_movimientos']
-            
-            # Calcular accuracy
-            if resultado.total_movimientos_modelo > 0 and stats_real['total_movimientos'] > 0:
-                resultado.accuracy_global = round(
-                    min(resultado.total_movimientos_modelo, stats_real['total_movimientos']) /
-                    max(resultado.total_movimientos_modelo, stats_real['total_movimientos']) * 100,
-                    2
+            # Buscar hoja S (contiene el mapeo)
+            if 'S' in xl.sheet_names:
+                df_s = pd.read_excel(xl, 'S')
+                
+                # Limpiar registros anteriores si existen
+                await self.db.execute(
+                    delete(SegregacionMapping).where(
+                        SegregacionMapping.resultado_id == resultado_id
+                    )
                 )
-                resultado.brecha_movimientos = stats_real['total_movimientos'] - resultado.total_movimientos_modelo
+                
+                batch_mappings = []
+                
+                for _, row in df_s.iterrows():
+                    if pd.notna(row.get('S')) and pd.notna(row.get('Segregacion')):
+                        codigo = str(row['S']).strip().upper()
+                        nombre = str(row['Segregacion']).strip()
+                        
+                        # Extraer tipo y tamaño del nombre
+                        tipo = 'EXPORT' if 'expo' in nombre.lower() else 'IMPORT'
+                        
+                        # Extraer tamaño (20 o 40)
+                        size = None
+                        if '-20-' in nombre:
+                            size = 20
+                        elif '-40-' in nombre:
+                            size = 40
+                        
+                        mapping = SegregacionMapping(
+                            resultado_id=resultado_id,
+                            codigo=codigo,
+                            nombre=nombre,
+                            tipo=tipo,
+                            size=size
+                        )
+                        batch_mappings.append(mapping)
+                        segregacion_map[codigo] = nombre
+                
+                if batch_mappings:
+                    self.db.add_all(batch_mappings)
+                    await self.db.flush()
+                    logger.info(f"✓ Cargados {len(batch_mappings)} mapeos de segregación")
             
-            await self.db.flush()
-            logger.info(f"✓ Comparación completada: Modelo={resultado.total_movimientos_modelo}, "
-                       f"Real={stats_real['total_movimientos']}, "
-                       f"Accuracy={resultado.accuracy_global}%")
+            return segregacion_map
             
         except Exception as e:
-            logger.error(f"Error comparando con realidad: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-    
+            logger.error(f"Error cargando mapeo de segregaciones: {e}")
+            return {}
     async def _process_real_data(self, df_turno: pd.DataFrame, resultado_id: UUID) -> Dict[str, Any]:
         """Procesa datos reales del turno"""
         
@@ -709,27 +933,90 @@ class CamilaLoader:
             'por_periodo': {},
             'por_bloque': {},
             'por_tipo': {},
-            'por_periodo_bloque': {}
+            'por_periodo_bloque': {},
+            'por_tipo_operacion': {
+                'recepcion': 0,
+                'entrega': 0,
+                'carga': 0,
+                'descarga': 0
+            }
         }
+        
+        # Mapear tipos de movimiento a operaciones del modelo
+        tipo_operacion_map = {
+            'RECV': 'recepcion',  # GATE -> Bloque
+            'DLVR': 'entrega',    # Bloque -> GATE
+            'LOAD': 'carga',      # Bloque -> Barco/Tren
+            'DSCH': 'descarga'    # Barco/Tren -> Bloque
+        }
+        
+        # Función mejorada para mapear bloques
+        def mapear_bloque_costanera(row):
+            """Mapea el bloque de Costanera involucrado en el movimiento"""
+            bloques_costanera = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']
+            
+            # Prioridad 1: origen (ime_fm)
+            if row['ime_fm'] in bloques_costanera:
+                return row['ime_fm']
+            # Prioridad 2: destino (ime_to)
+            elif row['ime_to'] in bloques_costanera:
+                return row['ime_to']
+            # Si no es de Costanera
+            else:
+                return 'OTROS'
+        
+        # Aplicar mapeo de bloques
+        df_turno['bloque'] = df_turno.apply(mapear_bloque_costanera, axis=1)
+        
+        # Filtrar solo movimientos de Costanera (no debería haber OTROS si el filtro previo funcionó bien)
+        df_costanera = df_turno[df_turno['bloque'] != 'OTROS'].copy()
+        
+        if len(df_costanera) < len(df_turno):
+            logger.warning(f"Se excluyeron {len(df_turno) - len(df_costanera)} movimientos que no involucran Costanera")
+        
+        # Actualizar total
+        stats['total_movimientos'] = len(df_costanera)
         
         # Agrupar por periodo
         for periodo in range(1, 9):
-            df_periodo = df_turno[df_turno['periodo'] == periodo]
+            df_periodo = df_costanera[df_costanera['periodo'] == periodo]
             stats['por_periodo'][periodo] = len(df_periodo)
         
-        # Agrupar por bloque (mapear códigos)
-        df_turno['bloque'] = df_turno['ime_fm'].apply(
-            lambda x: x if x in ['C1','C2','C3','C4','C5','C6','C7','C8','C9'] else 'OTROS'
-        )
-        stats['por_bloque'] = df_turno.groupby('bloque').size().to_dict()
+        # Agrupar por bloque
+        stats['por_bloque'] = df_costanera.groupby('bloque').size().to_dict()
         
-        # Agrupar por tipo
-        stats['por_tipo'] = df_turno.groupby('ime_move_kind').size().to_dict()
+        # Agrupar por tipo de movimiento
+        stats['por_tipo'] = df_costanera.groupby('ime_move_kind').size().to_dict()
         
-        # Agrupar por periodo-bloque
-        for (periodo, bloque), group in df_turno.groupby(['periodo', 'bloque']):
-            if bloque != 'OTROS':
-                stats['por_periodo_bloque'][(periodo, bloque)] = len(group)
+        # Calcular por tipo de operación
+        for _, row in df_costanera.iterrows():
+            tipo_op = tipo_operacion_map.get(row['ime_move_kind'], 'otros')
+            if tipo_op in stats['por_tipo_operacion']:
+                stats['por_tipo_operacion'][tipo_op] += 1
+        
+        # Agrupar por periodo-bloque (solo bloques de Costanera)
+        for (periodo, bloque), group in df_costanera.groupby(['periodo', 'bloque']):
+            stats['por_periodo_bloque'][(periodo, bloque)] = len(group)
+        
+        # Análisis adicional: movimientos por hora real
+        stats['por_hora_real'] = {}
+        for hora in range(24):
+            df_hora = df_costanera[df_costanera['hora'] == hora]
+            if len(df_hora) > 0:
+                stats['por_hora_real'][hora] = len(df_hora)
+        
+        # Log resumen del procesamiento
+        logger.info(f"📊 Resumen de datos reales procesados:")
+        logger.info(f"   - Total movimientos (Costanera): {stats['total_movimientos']}")
+        logger.info(f"   - Bloques activos: {len(stats['por_bloque'])}")
+        logger.info(f"   - Distribución por tipo: {stats['por_tipo']}")
+        logger.info(f"   - Periodos con actividad: {sum(1 for v in stats['por_periodo'].values() if v > 0)}/8")
+        
+        # Validación de coherencia
+        total_por_periodo = sum(stats['por_periodo'].values())
+        if total_por_periodo != stats['total_movimientos']:
+            logger.warning(f"Inconsistencia en totales: {total_por_periodo} (por periodo) vs "
+                        f"{stats['total_movimientos']} (total)")
         
         return stats
     
